@@ -1,7 +1,9 @@
 name = "multiquant-bot"
 main = "worker.js"
 compatibility_date = "2026-09-30"
-
+[observability]
+enabled = true
+head_sampling_rate = 1
 [vars]
 BOT_USERNAME = "multiquantacademybot"
 CHANNEL_USERNAME = "@multiquantacademy"
