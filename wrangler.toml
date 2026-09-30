@@ -14,7 +14,7 @@ OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
 [[d1_databases]]
 binding = "DB"
 database_name = "multiquant-db"
-database_id = "REPLACE_WITH_YOUR_MULTIIQUANT_DB_ID"
+database_id = "f4070bcf-0584-4c57-8fcd-19ec5cf7d5e2"
 
 [[durable_objects.bindings]]
 name = "OKX_MONITOR"
