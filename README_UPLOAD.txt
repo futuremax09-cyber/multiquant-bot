@@ -24,3 +24,4 @@ CRON_SECRET
 
 Workers Builds deploy command:
 npx wrangler deploy
+Cloudflare production build connected.
