@@ -1,0 +1,28 @@
+name = "multiquant-bot"
+main = "worker.js"
+compatibility_date = "2026-09-30"
+
+[vars]
+BOT_USERNAME = "multiquantacademybot"
+CHANNEL_USERNAME = "@multiquantacademy"
+CHANNEL_CHAT_ID = "@multiquantacademy"
+SIGNAL_SCAN_INTERVAL_MINUTES = "15"
+SIGNAL_MAX_24H = "30"
+SIGNAL_MIN_GAP_MINUTES = "45"
+OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "multiquant-db"
+database_id = "REPLACE_WITH_YOUR_MULTIIQUANT_DB_ID"
+
+[[durable_objects.bindings]]
+name = "OKX_MONITOR"
+class_name = "OkxMonitorDO"
+
+[exports.OkxMonitorDO]
+type = "durable-object"
+storage = "sqlite"
+
+[triggers]
+crons = ["*/5 * * * *"]
