@@ -1869,34 +1869,60 @@ async function ensureSignalHistory(env) {
     CREATE TABLE IF NOT EXISTS signal_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       symbol TEXT NOT NULL,
+      pair TEXT NOT NULL,
       direction TEXT NOT NULL,
-      message_id INTEGER,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      channel_message_id INTEGER,
+      sent_at TEXT NOT NULL
     )
   `).run();
 }
 
 async function getSignalQuota(env) {
   await ensureSignalHistory(env);
-  const max24h = Number(getEnv(env, "SIGNAL_MAX_24H", String(DEFAULTS.SIGNAL_MAX_24H)));
-  const minGap = Number(getEnv(env, "SIGNAL_MIN_GAP_MINUTES", String(DEFAULTS.SIGNAL_MIN_GAP_MINUTES)));
+
+  const max24h = Number(
+    getEnv(env, "SIGNAL_MAX_24H", String(DEFAULTS.SIGNAL_MAX_24H))
+  );
+
+  const minGap = Number(
+    getEnv(env, "SIGNAL_MIN_GAP_MINUTES", String(DEFAULTS.SIGNAL_MIN_GAP_MINUTES))
+  );
 
   const countRow = await env.DB.prepare(`
     SELECT COUNT(*) AS count24h
     FROM signal_history
-    WHERE created_at >= datetime('now', '-24 hours')
+    WHERE sent_at >= datetime('now', '-24 hours')
   `).first();
 
   const lastRow = await env.DB.prepare(`
-    SELECT created_at
+    SELECT sent_at
     FROM signal_history
     ORDER BY id DESC
     LIMIT 1
   `).first();
 
   const count24h = Number(countRow && countRow.count24h || 0);
-  const lastTime = lastRow && lastRow.created_at ? Date.parse(String(lastRow.created_at).replace(' ', 'T') + 'Z') : 0;
-  const minutesSinceLast = lastTime ? (Date.now() - lastTime) / 60000 : Infinity;
+
+  const rawLast = lastRow && lastRow.sent_at
+    ? String(lastRow.sent_at)
+    : "";
+
+  const normalizedLast = rawLast
+    ? rawLast.replace(" ", "T")
+    : "";
+
+  const lastTime = normalizedLast
+    ? Date.parse(
+        /[zZ]|[+-]\d{2}:\d{2}$/.test(normalizedLast)
+          ? normalizedLast
+          : `${normalizedLast}Z`
+      )
+    : 0;
+
+  const minutesSinceLast = lastTime
+    ? (Date.now() - lastTime) / 60000
+    : Infinity;
+
   const allowed = count24h < max24h && minutesSinceLast >= minGap;
 
   return {
@@ -1904,16 +1930,33 @@ async function getSignalQuota(env) {
     count24h: count24h,
     max24h: max24h,
     minGapMinutes: minGap,
-    minutesSinceLast: Number.isFinite(minutesSinceLast) ? Number(minutesSinceLast.toFixed(1)) : null
+    minutesSinceLast: Number.isFinite(minutesSinceLast)
+      ? Number(minutesSinceLast.toFixed(1))
+      : null
   };
 }
 
 async function recordSignalHistory(env, setup, messageId) {
   await ensureSignalHistory(env);
+
+  const symbol = String(setup && setup.symbol || "").trim();
+  const pair = String(
+    setup && setup.pair
+      ? setup.pair
+      : `${symbol}/USDT`
+  ).trim();
+  const direction = String(setup && setup.direction || "").trim();
+
   await env.DB.prepare(`
-    INSERT INTO signal_history (symbol, direction, message_id, created_at)
-    VALUES (?, ?, ?, datetime('now'))
-  `).bind(setup.symbol, setup.direction, Number(messageId)).run();
+    INSERT INTO signal_history
+      (symbol, pair, direction, channel_message_id, sent_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+  `).bind(
+    symbol,
+    pair,
+    direction,
+    Number(messageId)
+  ).run();
 }
 
 async function createSignalPosition(env, setup, messageId) {
@@ -2704,9 +2747,10 @@ async function ensureSchema(env) {
     `CREATE TABLE IF NOT EXISTS signal_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       symbol TEXT NOT NULL,
+      pair TEXT NOT NULL,
       direction TEXT NOT NULL,
-      message_id INTEGER,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      channel_message_id INTEGER,
+      sent_at TEXT NOT NULL
     )`,
 
     `CREATE TABLE IF NOT EXISTS signal_positions (
@@ -3155,6 +3199,7 @@ export class OkxMonitorDO extends DurableObject {
     if (wasTp1Hit) effectiveStop = Number(pos.entry_mid);
 
     const tp3Hit = Number(pos.tp3_hit || 0) === 1;
+    const tp3JustHit = reached.some(function(hit) { return hit.name === "TP3"; });
     if (tp3Hit) {
       const entry = Number(pos.entry_mid);
       if (pos.direction === "LONG" && Number(pos.highest_price) > entry) {
@@ -3165,7 +3210,7 @@ export class OkxMonitorDO extends DurableObject {
     }
 
     const stopHit = pos.direction === "LONG" ? low <= effectiveStop : high >= effectiveStop;
-    if (stopHit && (wasTp1Hit || tp3Hit)) {
+    if (stopHit && (wasTp1Hit || tp3Hit) && !tp3JustHit) {
       const entry = Number(pos.entry_mid);
       const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
       const highestProfit = Math.max(0, Math.abs((peak - entry) / entry) * 1000);
