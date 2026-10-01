@@ -3144,10 +3144,9 @@ async function runScheduledJobs(env) {
   try { await runNewsJob(env); } catch (error) { console.error("NEWS JOB ERROR", error); }
   try { await runEconomicJob(env); } catch (error) { console.error("ECONOMIC JOB ERROR", error); }
 
-  // Keep the Durable Object synchronized every cron cycle. Market candles are
-  // received over one persistent OKX WebSocket, so no per-position REST candle
-  // requests are made here.
-  try { await syncOkxMonitorDurableObject(env); } catch (error) { console.error("OKX MONITOR SYNC ERROR", error); }
+  // The Durable Object syncs itself from its 5-minute alarm.
+  // Do not call the DO from every Worker cron tick; that creates an unnecessary
+  // DO request and can produce sync errors even though the DO alarm is healthy.
 
   // Signal discovery runs every 15 minutes, never more than one signal per scan,
   // and the separate D1 history enforces the 30/24h + 45-minute gap quota.
@@ -3238,7 +3237,11 @@ export class OkxMonitorDO extends DurableObject {
       await this.syncPositions();
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectWebSocket();
     } catch (error) {
-      console.error("OKX MONITOR ALARM ERROR", error);
+      console.error("OKX MONITOR ALARM ERROR", JSON.stringify({
+        name: error && error.name,
+        message: error && error.message,
+        stack: error && error.stack
+      }));
     } finally {
       await this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
     }
