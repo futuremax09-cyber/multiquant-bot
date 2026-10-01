@@ -1903,16 +1903,10 @@ async function runSignalJob(env, tickers) {
 async function ensureSignalHistory(env) {
   if (!env.DB) return;
   await env.DB.prepare(`
-    CREATE TABLE IF NOT EXISTS signal_history (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT NOT NULL,
-      pair TEXT NOT NULL,
-      direction TEXT NOT NULL,
-      channel_message_id INTEGER,
-      sent_at TEXT NOT NULL
-    )
-  `).run();
-}
+`CREATE TABLE IF NOT EXISTS signal_event_guard (
+  event_key TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)`
 
 async function getSignalQuota(env) {
   await ensureSignalHistory(env);
