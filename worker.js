@@ -855,64 +855,98 @@ async function generateGemini(env, prompt) {
     return "I’m temporarily unable to connect to the AI service. Please try again shortly.";
   }
 
-  const model = getEnv(env, "GEMINI_MODEL", DEFAULTS.GEMINI_MODEL);
-  const endpoint =
-    "https://generativelanguage.googleapis.com/v1beta/models/" +
-    model +
-    ":generateContent";
+  const primaryModel = getEnv(env, "GEMINI_MODEL", DEFAULTS.GEMINI_MODEL);
+  const fallbackModel = getEnv(env, "GEMINI_FALLBACK_MODEL", "gemini-3.7-flash");
+  const models = [primaryModel];
+  if (fallbackModel && fallbackModel !== primaryModel) models.push(fallbackModel);
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": env.GEMINI_API_KEY
+  const requestBody = {
+    system_instruction: {
+      parts: [{
+        text:
+          "You are a professional multilingual sales consultant. " +
+          "Never invent commercial facts. Never guarantee trading outcomes."
+      }]
     },
-    body: JSON.stringify({
-      system_instruction: {
-        parts: [{
-          text:
-            "You are a professional multilingual sales consultant. " +
-            "Never invent commercial facts. Never guarantee trading outcomes."
-        }]
-      },
-      contents: [{
-        role: "user",
-        parts: [{ text: prompt }]
-      }],
-      generationConfig: {
-        temperature: 0.45,
-        maxOutputTokens: 500
+    contents: [{
+      role: "user",
+      parts: [{ text: prompt }]
+    }],
+    generationConfig: {
+      maxOutputTokens: 500
+    }
+  };
+
+  for (let index = 0; index < models.length; index++) {
+    const model = models[index];
+    const endpoint =
+      "https://generativelanguage.googleapis.com/v1beta/models/" +
+      model +
+      ":generateContent";
+
+    let response;
+    try {
+      response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": env.GEMINI_API_KEY
+        },
+        body: JSON.stringify(requestBody)
+      });
+    } catch (error) {
+      console.error("GEMINI FETCH ERROR", model, error);
+      if (index < models.length - 1) {
+        console.warn("GEMINI FALLBACK", JSON.stringify({ from: model, to: models[index + 1] }));
+        continue;
       }
-    })
-  });
+      break;
+    }
 
-  if (!response.ok) {
-    console.error("GEMINI ERROR", response.status, await response.text());
-    return "I’m having a temporary AI connection issue. Please try again in a moment.";
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("GEMINI ERROR", model, response.status, errorText);
+
+      // 429/5xx are transient provider/routing failures. Try the fallback model
+      // immediately instead of showing an AI connection error to the user.
+      const retryable = [429, 500, 502, 503, 504].includes(response.status);
+      if (retryable && index < models.length - 1) {
+        console.warn("GEMINI FALLBACK", JSON.stringify({
+          from: model,
+          to: models[index + 1],
+          status: response.status
+        }));
+        continue;
+      }
+
+      break;
+    }
+
+    const data = await response.json();
+    const candidates = data && data.candidates;
+    if (!Array.isArray(candidates) || !candidates.length) {
+      return "Tell me what you’re looking for and I’ll help you with the next step.";
+    }
+
+    const parts =
+      candidates[0] &&
+      candidates[0].content &&
+      candidates[0].content.parts;
+
+    if (!Array.isArray(parts)) {
+      return "Tell me what you’re looking for and I’ll help you with the next step.";
+    }
+
+    let text = "";
+    for (const part of parts) {
+      if (part && part.text) text += part.text;
+    }
+
+    return text.trim() ||
+      "Tell me what you’re looking for and I’ll help you with the next step.";
   }
 
-  const data = await response.json();
-  const candidates = data && data.candidates;
-  if (!Array.isArray(candidates) || !candidates.length) {
-    return "Tell me what you’re looking for and I’ll help you with the next step.";
-  }
-
-  const parts =
-    candidates[0] &&
-    candidates[0].content &&
-    candidates[0].content.parts;
-
-  if (!Array.isArray(parts)) {
-    return "Tell me what you’re looking for and I’ll help you with the next step.";
-  }
-
-  let text = "";
-  for (const part of parts) {
-    if (part && part.text) text += part.text;
-  }
-
-  return text.trim() ||
-    "Tell me what you’re looking for and I’ll help you with the next step.";
+  return "I’m having a temporary AI connection issue. Please try again in a moment.";
 }
 
 /* ============================================================
