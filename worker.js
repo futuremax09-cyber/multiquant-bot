@@ -75,6 +75,10 @@ const DEFAULTS = {
   SIGNAL_MAX_24H: 30,
   SIGNAL_MIN_GAP_MINUTES: 45,
   SIGNAL_SCAN_INTERVAL_MINUTES: 15,
+  SIGNAL_SYMBOL_COOLDOWN_MINUTES: 360,
+
+  // OKX production WebSocket uses the default HTTPS/WSS port (443).
+  OKX_WS_URL: "wss://ws.okx.com/ws/v5/business",
 
   // Follow-up schedule: days after last meaningful interaction.
   FOLLOWUP_DAYS: [1, 2, 3, 5, 7],
@@ -125,7 +129,7 @@ const INTERESTS = {
 ============================================================ */
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
@@ -163,8 +167,8 @@ export default {
         }
 
         const update = await request.json();
-        // Return immediately after dispatching. Telegram only needs a fast 200.
-        await handleUpdate(update, env);
+        // Acknowledge Telegram immediately; do all DB/Gemini work in the background.
+        ctx.waitUntil(handleUpdate(update, env));
         return textResponse("OK");
       }
 
@@ -1833,9 +1837,40 @@ async function runSignalJob(env, tickers) {
         break;
       }
 
-      const hourKey = Math.floor(Date.now() / 3600000);
-      const key = "signal:okx:" + setup.symbol + ":" + setup.direction + ":" + hourKey;
-      if (await hasMeta(env, key)) continue;
+      // HARD DEDUPE: never open a second position for the same symbol while
+      // one is already OPEN/CLOSING, and keep the same symbol+direction on a
+      // short cooldown after it was last posted. This also survives Worker
+      // restarts and overlapping cron executions because the guard is D1-backed.
+      const openRow = await env.DB.prepare(`
+        SELECT id FROM signal_positions
+        WHERE symbol=? AND status IN ('OPEN','CLOSING')
+        ORDER BY id DESC LIMIT 1
+      `).bind(setup.symbol).first();
+      if (openRow) {
+        console.log("SIGNAL BLOCK: OPEN POSITION", setup.symbol);
+        continue;
+      }
+
+      const cooldownMinutes = Number(
+        getEnv(env, "SIGNAL_SYMBOL_COOLDOWN_MINUTES", String(DEFAULTS.SIGNAL_SYMBOL_COOLDOWN_MINUTES))
+      );
+      const recentRow = await env.DB.prepare(`
+        SELECT id FROM signal_history
+        WHERE symbol=? AND direction=?
+          AND sent_at >= datetime('now', '-' || ? || ' minutes')
+        ORDER BY id DESC LIMIT 1
+      `).bind(setup.symbol, setup.direction, cooldownMinutes).first();
+      if (recentRow) {
+        console.log("SIGNAL BLOCK: COOLDOWN", setup.symbol, setup.direction);
+        continue;
+      }
+
+      const guardBucket = Math.floor(Date.now() / (cooldownMinutes * 60000));
+      const eventKey = "OPEN:" + setup.symbol + ":" + setup.direction + ":" + guardBucket;
+      if (!(await claimSignalEvent(env, eventKey))) {
+        console.log("SIGNAL BLOCK: CONCURRENT DUPLICATE", eventKey);
+        continue;
+      }
 
       const text =
         "📈 *CRYPTO FUTURES SIGNAL (USDT-M)*\n\n" +
@@ -1855,7 +1890,9 @@ async function runSignalJob(env, tickers) {
       if (sent && sent.message_id) {
         await createSignalPosition(env, setup, sent.message_id);
         await recordSignalHistory(env, setup, sent.message_id);
-        await setMeta(env, key, "1");
+      } else {
+        // Telegram failed: release the guard so a later scan can retry.
+        await releaseSignalEvent(env, eventKey);
       }
     }
   } catch (error) {
@@ -1957,6 +1994,40 @@ async function recordSignalHistory(env, setup, messageId) {
     direction,
     Number(messageId)
   ).run();
+}
+
+async function ensureSignalEventGuard(env) {
+  if (!env.DB) return;
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_event_guard (
+      event_key TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT datetime('now')
+    )
+  `).run();
+}
+
+async function claimSignalEvent(env, eventKey) {
+  if (!env.DB || !eventKey) return false;
+  try {
+    await ensureSignalEventGuard(env);
+    const result = await env.DB.prepare(`
+      INSERT OR IGNORE INTO signal_event_guard (event_key, created_at)
+      VALUES (?, datetime('now'))
+    `).bind(String(eventKey)).run();
+    return Number(result && result.meta && result.meta.changes || 0) === 1;
+  } catch (error) {
+    console.error("SIGNAL EVENT CLAIM ERROR", eventKey, error);
+    return false;
+  }
+}
+
+async function releaseSignalEvent(env, eventKey) {
+  if (!env.DB || !eventKey) return;
+  try {
+    await env.DB.prepare(`DELETE FROM signal_event_guard WHERE event_key=?`).bind(String(eventKey)).run();
+  } catch (error) {
+    console.error("SIGNAL EVENT RELEASE ERROR", eventKey, error);
+  }
 }
 
 async function createSignalPosition(env, setup, messageId) {
@@ -2773,7 +2844,12 @@ async function ensureSchema(env) {
       created_at TEXT,
       updated_at TEXT
     )`
-  ];
+,
+
+    `CREATE TABLE IF NOT EXISTS signal_event_guard (
+      event_key TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT datetime('now')
+    )`  ];
 
   for (const sql of statements) {
     try {
@@ -3016,6 +3092,10 @@ export class OkxMonitorDO extends DurableObject {
     this.ws = null;
     this.wsConnecting = false;
     this.lastSyncAt = 0;
+    this.lastWsMessageAt = Date.now();
+    this.wsReconnectDelay = 5000;
+    this.wsReconnectTimer = null;
+    this.wsHeartbeatTimer = null;
     this.connectWebSocket();
     this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
   }
@@ -3050,35 +3130,83 @@ export class OkxMonitorDO extends DurableObject {
 
   async connectWebSocket() {
     if (this.wsConnecting || (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING))) return;
+
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+
     this.wsConnecting = true;
-    const url = getEnv(this.env, "OKX_WS_URL", "wss://ws.okx.com:8443/ws/v5/business");
+    const url = getEnv(this.env, "OKX_WS_URL", DEFAULTS.OKX_WS_URL);
+
     try {
       console.log("OKX MONITOR WS CONNECT", url);
       const ws = new WebSocket(url);
       this.ws = ws;
+
       ws.addEventListener("open", async () => {
         this.wsConnecting = false;
-        console.log("OKX MONITOR WS OPEN");
+        this.wsReconnectDelay = 5000;
+        this.lastWsMessageAt = Date.now();
+        console.log("OKX MONITOR WS OPEN", url);
+
+        if (this.wsHeartbeatTimer) clearInterval(this.wsHeartbeatTimer);
+        this.wsHeartbeatTimer = setInterval(() => {
+          try {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+            const silentFor = Date.now() - this.lastWsMessageAt;
+            if (silentFor >= 20000) {
+              console.log("OKX MONITOR WS HEARTBEAT PING", silentFor);
+              this.ws.send("ping");
+            }
+          } catch (error) {
+            console.error("OKX MONITOR WS HEARTBEAT ERROR", error);
+          }
+        }, 20000);
+
         await this.reconcileSubscriptions(true);
       });
+
       ws.addEventListener("message", async (event) => {
+        this.lastWsMessageAt = Date.now();
         await this.handleWsMessage(event.data);
       });
-      ws.addEventListener("close", () => {
+
+      ws.addEventListener("close", (event) => {
         this.wsConnecting = false;
-        this.ws = null;
+        if (this.wsHeartbeatTimer) {
+          clearInterval(this.wsHeartbeatTimer);
+          this.wsHeartbeatTimer = null;
+        }
+        if (this.ws === ws) this.ws = null;
         this.subscribed.clear();
-        console.warn("OKX MONITOR WS CLOSE");
-        this.state.storage.setAlarm(Date.now() + 5000);
-        this.connectWebSocket();
+
+        const delay = this.wsReconnectDelay;
+        this.wsReconnectDelay = Math.min(this.wsReconnectDelay * 2, 60000);
+        console.warn("OKX MONITOR WS CLOSE", JSON.stringify({ code: event && event.code, reason: event && event.reason, reconnectInMs: delay }));
+
+        if (!this.wsReconnectTimer) {
+          this.wsReconnectTimer = setTimeout(() => {
+            this.wsReconnectTimer = null;
+            this.connectWebSocket();
+          }, delay);
+        }
       });
+
       ws.addEventListener("error", (error) => {
-        console.error("OKX MONITOR WS ERROR", error);
+        console.error("OKX MONITOR WS ERROR", error && error.message ? error.message : error);
       });
     } catch (error) {
       this.wsConnecting = false;
+      const delay = this.wsReconnectDelay;
+      this.wsReconnectDelay = Math.min(this.wsReconnectDelay * 2, 60000);
       console.error("OKX MONITOR WS CONNECT ERROR", error);
-      this.state.storage.setAlarm(Date.now() + 5000);
+      if (!this.wsReconnectTimer) {
+        this.wsReconnectTimer = setTimeout(() => {
+          this.wsReconnectTimer = null;
+          this.connectWebSocket();
+        }, delay);
+      }
     }
   }
 
@@ -3131,9 +3259,13 @@ export class OkxMonitorDO extends DurableObject {
 
   async handleWsMessage(raw) {
     try {
-      if (typeof raw === "string" && raw.toLowerCase() === "ping") {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send("pong");
-        return;
+      if (typeof raw === "string") {
+        const control = raw.trim().toLowerCase();
+        if (control === "ping") {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send("pong");
+          return;
+        }
+        if (control === "pong") return;
       }
       const message = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (!message) return;
@@ -3184,6 +3316,13 @@ export class OkxMonitorDO extends DurableObject {
     }
 
     for (const hit of reached) {
+      const eventKey = "TP:" + pos.id + ":" + hit.name;
+      const claimed = await claimSignalEvent(this.env, eventKey);
+      if (!claimed) {
+        console.log("TP DUPLICATE BLOCK", eventKey);
+        continue;
+      }
+
       const profit = Math.abs((hit.price - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000;
       const extra = hit.name === "TP1" ? "\n\n_⚠️ SL is now protected at entry until the trade moves further in your favor._" : "";
       const msg = "🎯 *" + hit.name + " HIT*\n\n" +
@@ -3191,7 +3330,14 @@ export class OkxMonitorDO extends DurableObject {
         "Target Reached:\n" +
         "💰 Price: `" + fmt(hit.price) + "`\n" +
         "📈 Profit: *+" + profit.toFixed(1) + "%*" + extra;
-      if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
+      const sent = pos.channel_message_id
+        ? await sendTelegramReply(this.env, msg, pos.channel_message_id)
+        : true;
+      if (!sent) {
+        await releaseSignalEvent(this.env, eventKey);
+        pos[hit.name.toLowerCase() + "_hit"] = 0;
+        continue;
+      }
       await this.persistPosition(pos);
     }
 
@@ -3222,7 +3368,22 @@ export class OkxMonitorDO extends DurableObject {
         targetStatus + "\n\n" +
         "🔒 Position Closed at Peak\n" +
         "📊 Closed Profit: *+" + highestProfit.toFixed(1) + "%*";
-      if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
+      const closeEventKey = "CLOSE:" + pos.id;
+      const closeClaimed = await claimSignalEvent(this.env, closeEventKey);
+      if (!closeClaimed) {
+        console.log("CLOSE DUPLICATE BLOCK", closeEventKey);
+        return;
+      }
+
+      const closeSent = pos.channel_message_id
+        ? await sendTelegramReply(this.env, msg, pos.channel_message_id)
+        : true;
+
+      if (!closeSent) {
+        await releaseSignalEvent(this.env, closeEventKey);
+        return;
+      }
+
       pos.status = "CLOSED";
       await this.persistPosition(pos);
       this.positions.delete(symbol);
