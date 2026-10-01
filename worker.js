@@ -3037,7 +3037,12 @@ async function syncOkxMonitorDurableObject(env) {
 function isSignalScanDue() {
   const minutes = new Date().getMinutes();
   const interval = Number(DEFAULTS.SIGNAL_SCAN_INTERVAL_MINUTES) || 15;
-  return minutes % interval === 0;
+  // Cron executions can arrive a few minutes after the nominal boundary.
+  // The old exact-minute check (minute % interval === 0) could miss every
+  // scan when a 5-minute cron fired at :01, :06, :11, :16, ... .
+  // Treat the first 5 minutes of each interval as the scan window.
+  const remainder = minutes % interval;
+  return remainder >= 0 && remainder < 5;
 }
 
 async function runScheduledJobs(env) {
