@@ -3131,7 +3131,12 @@ export class OkxMonitorDO extends DurableObject {
     this.lastSyncAt = 0;
     this.tickerCache = new Map();
     this.tickersSubscribed = false;
+    this.tickerWs = null;
+    this.tickerWsConnecting = false;
+    this.tickerReconnectTimer = null;
+    this.tickerReconnectAttempts = 0;
     this.connectWebSocket();
+    this.connectTickerWebSocket();
     this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
   }
 
@@ -3166,6 +3171,7 @@ export class OkxMonitorDO extends DurableObject {
       await this.flushPositionsToD1();
       await this.syncPositions();
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectWebSocket();
+      if (!this.tickerWs || this.tickerWs.readyState !== WebSocket.OPEN) this.connectTickerWebSocket();
     } catch (error) {
       console.error("OKX MONITOR ALARM ERROR", error);
     } finally {
@@ -3263,17 +3269,96 @@ export class OkxMonitorDO extends DurableObject {
     }, delay);
   }
 
+  async connectTickerWebSocket() {
+    if (this.tickerWsConnecting || (this.tickerWs && (this.tickerWs.readyState === WebSocket.OPEN || this.tickerWs.readyState === WebSocket.CONNECTING))) return;
+
+    this.tickerWsConnecting = true;
+    const url = getEnv(this.env, "OKX_PUBLIC_WS_URL", "wss://ws.okx.com/ws/v5/public");
+
+    try {
+      console.log("OKX TICKER WS CONNECT", url);
+      const ws = new WebSocket(url);
+      this.tickerWs = ws;
+
+      ws.addEventListener("open", () => {
+        this.tickerWsConnecting = false;
+        this.tickerReconnectAttempts = 0;
+        this.tickersSubscribed = true;
+        ws.send(JSON.stringify({
+          op: "subscribe",
+          args: [{ channel: "tickers", instType: "SWAP" }]
+        }));
+        console.log("OKX TICKER WS OPEN");
+        console.log("OKX TICKER WS TICKERS SUBSCRIBED");
+      });
+
+      ws.addEventListener("message", async (event) => {
+        await this.handleTickerWsMessage(event.data);
+      });
+
+      ws.addEventListener("close", (event) => {
+        this.tickerWsConnecting = false;
+        if (this.tickerWs === ws) this.tickerWs = null;
+        this.tickersSubscribed = false;
+        console.warn("OKX TICKER WS CLOSE", JSON.stringify({code:event && event.code, reason:event && event.reason}));
+        this.scheduleTickerReconnect();
+      });
+
+      ws.addEventListener("error", (error) => {
+        console.error("OKX TICKER WS ERROR", {
+          type: error && error.type,
+          message: error && error.message,
+          readyState: ws.readyState
+        });
+      });
+    } catch (error) {
+      this.tickerWsConnecting = false;
+      console.error("OKX TICKER WS CONNECT ERROR", error);
+      this.scheduleTickerReconnect();
+    }
+  }
+
+  scheduleTickerReconnect() {
+    if (this.tickerReconnectTimer) return;
+    const attempt = Math.min(this.tickerReconnectAttempts || 0, 6);
+    const base = Math.min(60000, 2000 * Math.pow(2, attempt));
+    const jitter = Math.floor(Math.random() * 1000);
+    const delay = base + jitter;
+    this.tickerReconnectAttempts = attempt + 1;
+    console.log("OKX TICKER WS RECONNECT SCHEDULED", JSON.stringify({attempt:this.tickerReconnectAttempts, delayMs:delay}));
+    this.tickerReconnectTimer = setTimeout(() => {
+      this.tickerReconnectTimer = null;
+      this.connectTickerWebSocket();
+    }, delay);
+  }
+
+  async handleTickerWsMessage(raw) {
+    try {
+      if (typeof raw === "string" && raw.toLowerCase() === "ping") {
+        if (this.tickerWs && this.tickerWs.readyState === WebSocket.OPEN) this.tickerWs.send("pong");
+        return;
+      }
+      const message = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (!message) return;
+      if (message.event === "error") {
+        console.error("OKX TICKER WS EVENT ERROR", message);
+        return;
+      }
+      if (message.arg && message.arg.channel === "tickers" && Array.isArray(message.data)) {
+        for (const ticker of message.data) {
+          if (ticker && ticker.instId) this.tickerCache.set(ticker.instId, ticker);
+        }
+        if (this.tickerCache.size && this.tickerCache.size % 100 === 0) {
+          console.log("OKX TICKER WS SNAPSHOT", JSON.stringify({count:this.tickerCache.size}));
+        }
+      }
+    } catch (error) {
+      console.error("OKX TICKER WS MESSAGE ERROR", error);
+    }
+  }
+
   async reconcileSubscriptions(forceAll) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-
-    if (!this.tickersSubscribed) {
-      this.ws.send(JSON.stringify({
-        op: "subscribe",
-        args: [{ channel: "tickers", instType: "SWAP" }]
-      }));
-      this.tickersSubscribed = true;
-      console.log("OKX MONITOR WS TICKERS SUBSCRIBED");
-    }
 
     const desired = new Set(this.positions.keys());
     const toSubscribe = [];
@@ -3330,12 +3415,6 @@ export class OkxMonitorDO extends DurableObject {
       if (!message) return;
       if (message.event === "error") {
         console.error("OKX MONITOR WS EVENT ERROR", message);
-        return;
-      }
-      if (message.arg && message.arg.channel === "tickers" && Array.isArray(message.data)) {
-        for (const ticker of message.data) {
-          if (ticker && ticker.instId) this.tickerCache.set(ticker.instId, ticker);
-        }
         return;
       }
       if (!message.data || !message.arg || message.arg.channel !== "candle5m") return;
