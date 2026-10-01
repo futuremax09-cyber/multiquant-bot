@@ -3060,9 +3060,29 @@ async function syncOkxMonitorDurableObject(env) {
   try {
     const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
     const stub = env.OKX_MONITOR.get(id);
-    await stub.fetch("https://okx-monitor/sync", { method: "POST" });
+    const response = await stub.fetch("https://okx-monitor/sync", { method: "POST" });
+
+    if (!response || !response.ok) {
+      let responseText = "";
+      try {
+        responseText = response ? await response.text() : "NO_RESPONSE";
+      } catch (readError) {
+        responseText = "RESPONSE_READ_ERROR: " + (readError && readError.message ? readError.message : String(readError));
+      }
+      console.error("OKX MONITOR DO SYNC RESPONSE ERROR", JSON.stringify({
+        status: response ? response.status : null,
+        statusText: response ? response.statusText : null,
+        body: responseText
+      }));
+    } else {
+      console.log("OKX MONITOR DO SYNC OK", JSON.stringify({ status: response.status }));
+    }
   } catch (error) {
-    console.error("OKX MONITOR DO SYNC ERROR", error);
+    console.error("OKX MONITOR DO SYNC ERROR", JSON.stringify({
+      name: error && error.name ? error.name : null,
+      message: error && error.message ? error.message : String(error),
+      stack: error && error.stack ? error.stack : null
+    }));
   }
 }
 
@@ -3135,10 +3155,6 @@ export class OkxMonitorDO extends DurableObject {
     this.tickerWsConnecting = false;
     this.tickerReconnectTimer = null;
     this.tickerReconnectAttempts = 0;
-    this.tickerHeartbeatTimer = null;
-    this.lastTickerWsMessageAt = Date.now();
-    this.tickerInstrumentIds = null;
-    this.tickerInstrumentFetchedAt = 0;
     this.connectWebSocket();
     this.connectTickerWebSocket();
     this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
@@ -3273,67 +3289,6 @@ export class OkxMonitorDO extends DurableObject {
     }, delay);
   }
 
-  async getTickerInstrumentIds() {
-    const now = Date.now();
-    if (Array.isArray(this.tickerInstrumentIds) && this.tickerInstrumentIds.length && (now - this.tickerInstrumentFetchedAt) < 6 * 60 * 60 * 1000) {
-      return this.tickerInstrumentIds;
-    }
-
-    try {
-      const response = await fetch(
-        "https://www.okx.com/api/v5/public/instruments?instType=SWAP",
-        { method: "GET", headers: { "Accept": "application/json" } }
-      );
-      if (!response.ok) {
-        console.error("OKX TICKER INSTRUMENTS ERROR", response.status);
-        return Array.isArray(this.tickerInstrumentIds) ? this.tickerInstrumentIds : [];
-      }
-
-      const payload = await response.json();
-      const ids = Array.isArray(payload.data)
-        ? payload.data
-            .filter(item => item && item.instType === "SWAP" && typeof item.instId === "string" && item.instId.endsWith("-USDT-SWAP"))
-            .map(item => item.instId)
-        : [];
-
-      if (!ids.length) {
-        console.warn("OKX TICKER INSTRUMENTS EMPTY");
-        return Array.isArray(this.tickerInstrumentIds) ? this.tickerInstrumentIds : [];
-      }
-
-      this.tickerInstrumentIds = Array.from(new Set(ids));
-      this.tickerInstrumentFetchedAt = now;
-      console.log("OKX TICKER INSTRUMENTS LOADED", JSON.stringify({ count: this.tickerInstrumentIds.length }));
-      return this.tickerInstrumentIds;
-    } catch (error) {
-      console.error("OKX TICKER INSTRUMENTS FETCH ERROR", error);
-      return Array.isArray(this.tickerInstrumentIds) ? this.tickerInstrumentIds : [];
-    }
-  }
-
-  startTickerHeartbeat() {
-    this.stopTickerHeartbeat();
-    this.lastTickerWsMessageAt = Date.now();
-    this.tickerHeartbeatTimer = setInterval(() => {
-      try {
-        if (!this.tickerWs || this.tickerWs.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - this.lastTickerWsMessageAt >= 20000) {
-          this.tickerWs.send("ping");
-          console.log("OKX TICKER WS HEARTBEAT");
-        }
-      } catch (error) {
-        console.error("OKX TICKER WS HEARTBEAT ERROR", error);
-      }
-    }, 10000);
-  }
-
-  stopTickerHeartbeat() {
-    if (this.tickerHeartbeatTimer) {
-      clearInterval(this.tickerHeartbeatTimer);
-      this.tickerHeartbeatTimer = null;
-    }
-  }
-
   async connectTickerWebSocket() {
     if (this.tickerWsConnecting || (this.tickerWs && (this.tickerWs.readyState === WebSocket.OPEN || this.tickerWs.readyState === WebSocket.CONNECTING))) return;
 
@@ -3345,42 +3300,24 @@ export class OkxMonitorDO extends DurableObject {
       const ws = new WebSocket(url);
       this.tickerWs = ws;
 
-      ws.addEventListener("open", async () => {
+      ws.addEventListener("open", () => {
         this.tickerWsConnecting = false;
         this.tickerReconnectAttempts = 0;
-        this.tickersSubscribed = false;
-        this.startTickerHeartbeat();
-
-        const instrumentIds = await this.getTickerInstrumentIds();
-        if (!instrumentIds.length || this.tickerWs !== ws || ws.readyState !== WebSocket.OPEN) {
-          console.error("OKX TICKER WS NO_INSTRUMENTS");
-          try { ws.close(); } catch (_) {}
-          return;
-        }
-
-        // OKX's current tickers channel requires an instId. Subscribe to all
-        // USDT perpetuals in bounded batches instead of using the rejected
-        // { channel: "tickers", instType: "SWAP" } form.
-        const batchSize = 100;
-        let sent = 0;
-        for (let i = 0; i < instrumentIds.length; i += batchSize) {
-          const batch = instrumentIds.slice(i, i + batchSize).map(instId => ({ channel: "tickers", instId }));
-          ws.send(JSON.stringify({ op: "subscribe", args: batch }));
-          sent += batch.length;
-        }
         this.tickersSubscribed = true;
+        ws.send(JSON.stringify({
+          op: "subscribe",
+          args: [{ channel: "tickers", instType: "SWAP" }]
+        }));
         console.log("OKX TICKER WS OPEN");
-        console.log("OKX TICKER WS TICKERS SUBSCRIBED", JSON.stringify({ count: sent, batchSize }));
+        console.log("OKX TICKER WS TICKERS SUBSCRIBED");
       });
 
       ws.addEventListener("message", async (event) => {
-        this.lastTickerWsMessageAt = Date.now();
         await this.handleTickerWsMessage(event.data);
       });
 
       ws.addEventListener("close", (event) => {
         this.tickerWsConnecting = false;
-        this.stopTickerHeartbeat();
         if (this.tickerWs === ws) this.tickerWs = null;
         this.tickersSubscribed = false;
         console.warn("OKX TICKER WS CLOSE", JSON.stringify({code:event && event.code, reason:event && event.reason}));
@@ -3396,7 +3333,6 @@ export class OkxMonitorDO extends DurableObject {
       });
     } catch (error) {
       this.tickerWsConnecting = false;
-      this.stopTickerHeartbeat();
       console.error("OKX TICKER WS CONNECT ERROR", error);
       this.scheduleTickerReconnect();
     }
