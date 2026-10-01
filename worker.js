@@ -125,7 +125,7 @@ const INTERESTS = {
 ============================================================ */
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
 
@@ -163,8 +163,8 @@ export default {
         }
 
         const update = await request.json();
-        // Return immediately after dispatching. Telegram only needs a fast 200.
-        await handleUpdate(update, env);
+        // Acknowledge Telegram immediately; continue processing in the background.
+        ctx.waitUntil(handleUpdate(update, env));
         return textResponse("OK");
       }
 
@@ -1746,6 +1746,27 @@ async function publishEconomic(env, event, stage) {
 ============================================================ */
 
 async function getOkxTickers(env) {
+  // Prefer the persistent OKX WebSocket ticker stream. This avoids repeatedly
+  // hitting the public REST /market/tickers endpoint from the Worker IP.
+  if (env.OKX_MONITOR) {
+    try {
+      const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
+      const stub = env.OKX_MONITOR.get(id);
+      const response = await stub.fetch("https://okx-monitor/tickers", { method: "GET" });
+      if (response.ok) {
+        const payload = await response.json();
+        const wsTickers = Array.isArray(payload.tickers) ? payload.tickers : [];
+        if (wsTickers.length) {
+          console.log("OKX TICKERS WS SNAPSHOT", JSON.stringify({ count: wsTickers.length }));
+          return wsTickers;
+        }
+        console.warn("OKX TICKERS WS CACHE EMPTY");
+      }
+    } catch (error) {
+      console.error("OKX TICKERS WS SNAPSHOT ERROR", error);
+    }
+  }
+
   const cooldownKey = "okx:ticker:429:cooldown";
   const cooldownUntil = Number(await getMeta(env, cooldownKey) || 0);
   if (cooldownUntil && Date.now() < cooldownUntil) {
@@ -1774,6 +1795,7 @@ async function getOkxTickers(env) {
     const tickers = Array.isArray(payload.data) ? payload.data : [];
     if (!tickers.length) return null;
     if (cooldownUntil) await setMeta(env, cooldownKey, "0");
+    console.log("OKX TICKERS REST SNAPSHOT", JSON.stringify({ count: tickers.length }));
     return tickers;
   } catch (error) {
     console.error("OKX TICKERS FETCH ERROR", error);
@@ -1787,23 +1809,15 @@ async function runSignalJob(env, tickers) {
     db: !!env.DB,
     tickers: Array.isArray(tickers) ? tickers.length : 0
   }));
-
-  if (!isEnabled(env, "SIGNALS_ENABLED", true)) {
-    console.log("SIGNAL SCAN SKIP", "SIGNALS_ENABLED=false");
-    return;
-  }
-  if (!env.DB) {
-    console.log("SIGNAL SCAN SKIP", "DB_MISSING");
-    return;
-  }
+  if (!isEnabled(env, "SIGNALS_ENABLED", true)) return;
+  if (!env.DB) return;
   if (!Array.isArray(tickers) || !tickers.length) {
-    console.log("SIGNAL SCAN SKIP", "NO_TICKERS");
+    console.warn("SIGNAL SCAN SKIP NO_TICKERS");
     return;
   }
 
   try {
     const quota = await getSignalQuota(env);
-    console.log("SIGNAL QUOTA", JSON.stringify(quota));
     if (!quota.allowed) {
       console.log("SIGNAL QUOTA BLOCK", JSON.stringify(quota));
       return;
@@ -1817,18 +1831,12 @@ async function runSignalJob(env, tickers) {
         Number(item.last || 0) > 0;
     });
 
-    console.log("SIGNAL USDT FILTER", JSON.stringify({
-      totalTickers: tickers.length,
-      usdtSwaps: usdt.length
-    }));
-
+    console.log("SIGNAL USDT FILTER", JSON.stringify({ input: tickers.length, usdt: usdt.length }));
     if (!usdt.length) {
-      console.log("SIGNAL SCAN SKIP", "NO_USDT_SWAPS");
+      console.warn("SIGNAL SCAN SKIP NO_USDT_SWAPS");
       return;
     }
 
-    // Rank the complete USDT universe first. Detailed 15m candles are fetched
-    // only for the strongest candidates to keep OKX request volume controlled.
     usdt.sort(function(a, b) {
       const aChange = pct24h(a);
       const bChange = pct24h(b);
@@ -1841,44 +1849,18 @@ async function runSignalJob(env, tickers) {
 
     const setups = [];
     const maxCandidates = Math.min(usdt.length, 5);
-    console.log("SIGNAL CANDIDATES", JSON.stringify({
-      candidateCount: maxCandidates,
-      candidates: usdt.slice(0, maxCandidates).map(function(item) { return item.instId; })
-    }));
 
     for (let i = 0; i < maxCandidates; i++) {
-      try {
-        const setup = await buildOkxSetup(usdt[i]);
-        if (setup) {
-          setups.push(setup);
-          console.log("SIGNAL SETUP QUALIFIED", JSON.stringify({
-            symbol: setup.symbol,
-            direction: setup.direction,
-            score: setup.score
-          }));
-        } else {
-          console.log("SIGNAL SETUP REJECTED", usdt[i].instId);
-        }
-      } catch (candidateError) {
-        console.error("SIGNAL CANDIDATE ERROR", usdt[i].instId, candidateError);
-      }
+      const setup = await buildOkxSetup(usdt[i]);
+      if (setup) setups.push(setup);
     }
 
     setups.sort(function(a, b) { return b.score - a.score; });
     console.log("SIGNAL SETUPS FOUND", JSON.stringify({
       count: setups.length,
-      best: setups.length ? {
-        symbol: setups[0].symbol,
-        direction: setups[0].direction,
-        score: setups[0].score
-      } : null
+      best: setups.length ? { symbol: setups[0].symbol, direction: setups[0].direction, score: setups[0].score } : null
     }));
-
-    const selected = setups.slice(0, 1); // never more than one signal per scan
-    if (!selected.length) {
-      console.log("SIGNAL SCAN COMPLETE", "NO_QUALIFIED_SETUP");
-      return;
-    }
+    const selected = setups.slice(0, 1);
 
     for (const setup of selected) {
       const quotaNow = await getSignalQuota(env);
@@ -1887,41 +1869,42 @@ async function runSignalJob(env, tickers) {
         break;
       }
 
+      // Never open another live position for the same symbol.
+      if (await hasOpenSignalForSymbol(env, setup.symbol)) {
+        console.log("SIGNAL OPEN POSITION BLOCK", setup.symbol);
+        continue;
+      }
+
       const hourKey = Math.floor(Date.now() / 3600000);
-      const key = "signal:okx:" + setup.symbol + ":" + setup.direction + ":" + hourKey;
-      if (await hasMeta(env, key)) continue;
+      const eventKey = "open:" + setup.symbol + ":" + setup.direction + ":" + hourKey;
+      if (!(await claimSignalEvent(env, eventKey))) continue;
 
-      const text =
-        "📈 *CRYPTO FUTURES SIGNAL (USDT-M)*\n\n" +
-        "Pair: `" + setup.pair + "`\n" +
-        "Direction: *" + setup.direction + "*\n" +
-        "Leverage: *10X*\n\n" +
-        "Entry: `" + setup.entry + "`\n\n" +
-        "TP1: `" + setup.tp1 + "` — " + setup.tp1Pct + "%\n" +
-        "TP2: `" + setup.tp2 + "` — " + setup.tp2Pct + "%\n" +
-        "TP3: `" + setup.tp3 + "` — " + setup.tp3Pct + "%\n\n" +
-        "SL: `" + setup.sl + "`\n\n" +
-        "_⚠️ Move your SL to entry after the first target is hit._\n\n" +
-        "_📊 Trade Setup: " + setup.tradeSetup + " — " + setup.timeframe + "_\n\n" +
-        "#BTCUSDT #BTC #CRYPTO #" + setup.coinTag;
+      try {
+        const text =
+          "📈 *CRYPTO FUTURES SIGNAL (USDT-M)*\n\n" +
+          "Pair: `" + setup.pair + "`\n" +
+          "Direction: *" + setup.direction + "*\n" +
+          "Leverage: *10X*\n\n" +
+          "Entry: `" + setup.entry + "`\n\n" +
+          "TP1: `" + setup.tp1 + "` — " + setup.tp1Pct + "%\n" +
+          "TP2: `" + setup.tp2 + "` — " + setup.tp2Pct + "%\n" +
+          "TP3: `" + setup.tp3 + "` — " + setup.tp3Pct + "%\n\n" +
+          "SL: `" + setup.sl + "`\n\n" +
+          "_⚠️ Move your SL to entry after the first target is hit._\n\n" +
+          "_📊 Trade Setup: " + setup.tradeSetup + " — " + setup.timeframe + "_\n\n" +
+          "#BTCUSDT #BTC #CRYPTO #" + setup.coinTag;
 
-      console.log("SIGNAL SEND ATTEMPT", JSON.stringify({
-        symbol: setup.symbol,
-        direction: setup.direction,
-        score: setup.score
-      }));
-      const sent = await sendPublicChannel(env, text);
-      if (sent && sent.message_id) {
-        console.log("SIGNAL SENT", JSON.stringify({
-          symbol: setup.symbol,
-          direction: setup.direction,
-          message_id: sent.message_id
-        }));
-        await createSignalPosition(env, setup, sent.message_id);
-        await recordSignalHistory(env, setup, sent.message_id);
-        await setMeta(env, key, "1");
-      } else {
-        console.error("SIGNAL SEND FAILED", JSON.stringify(sent || null));
+        const sent = await sendPublicChannel(env, text);
+        if (sent && sent.message_id) {
+          await createSignalPosition(env, setup, sent.message_id);
+          await recordSignalHistory(env, setup, sent.message_id);
+          await setMeta(env, "signal:okx:" + setup.symbol + ":" + setup.direction + ":" + hourKey, "1");
+        } else {
+          await releaseSignalEvent(env, eventKey);
+        }
+      } catch (error) {
+        await releaseSignalEvent(env, eventKey);
+        throw error;
       }
     }
   } catch (error) {
@@ -2023,6 +2006,50 @@ async function recordSignalHistory(env, setup, messageId) {
     direction,
     Number(messageId)
   ).run();
+}
+
+async function ensureSignalEventGuard(env) {
+  if (!env.DB) return;
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS signal_event_guard (
+      event_key TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+}
+
+async function claimSignalEvent(env, eventKey) {
+  if (!env.DB || !eventKey) return false;
+  try {
+    await ensureSignalEventGuard(env);
+    const result = await env.DB.prepare(`
+      INSERT OR IGNORE INTO signal_event_guard (event_key, created_at)
+      VALUES (?, CURRENT_TIMESTAMP)
+    `).bind(String(eventKey)).run();
+    return Number(result && result.meta && result.meta.changes || 0) === 1;
+  } catch (error) {
+    console.error("SIGNAL EVENT CLAIM ERROR", eventKey, error);
+    return false;
+  }
+}
+
+async function releaseSignalEvent(env, eventKey) {
+  if (!env.DB || !eventKey) return;
+  try {
+    await env.DB.prepare(`DELETE FROM signal_event_guard WHERE event_key = ?`).bind(String(eventKey)).run();
+  } catch (error) {
+    console.error("SIGNAL EVENT RELEASE ERROR", eventKey, error);
+  }
+}
+
+async function hasOpenSignalForSymbol(env, symbol) {
+  if (!env.DB || !symbol) return false;
+  const row = await env.DB.prepare(`
+    SELECT id FROM signal_positions
+    WHERE symbol = ? AND status IN ('OPEN','CLOSING')
+    ORDER BY id DESC LIMIT 1
+  `).bind(String(symbol)).first();
+  return !!row;
 }
 
 async function createSignalPosition(env, setup, messageId) {
@@ -2838,6 +2865,11 @@ async function ensureSchema(env) {
       channel_message_id INTEGER,
       created_at TEXT,
       updated_at TEXT
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS signal_event_guard (
+      event_key TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 
@@ -2845,7 +2877,7 @@ async function ensureSchema(env) {
     try {
       await env.DB.prepare(sql).run();
     } catch (error) {
-      console.error("D1 SCHEMA ERROR", error);
+      console.error("D1 SCHEMA ERROR", error && error.message ? error.message : error);
     }
   }
 
@@ -3037,12 +3069,10 @@ async function syncOkxMonitorDurableObject(env) {
 function isSignalScanDue() {
   const minutes = new Date().getMinutes();
   const interval = Number(DEFAULTS.SIGNAL_SCAN_INTERVAL_MINUTES) || 15;
-  // Cron executions can arrive a few minutes after the nominal boundary.
-  // The old exact-minute check (minute % interval === 0) could miss every
-  // scan when a 5-minute cron fired at :01, :06, :11, :16, ... .
-  // Treat the first 5 minutes of each interval as the scan window.
-  const remainder = minutes % interval;
-  return remainder >= 0 && remainder < 5;
+  // Cloudflare Cron can fire a few seconds into the scheduled minute.
+  // The Worker currently runs every 5 minutes, so accept the first 5-minute
+  // window of each signal interval instead of requiring an exact minute.
+  return (minutes % interval) < 5;
 }
 
 async function runScheduledJobs(env) {
@@ -3061,26 +3091,22 @@ async function runScheduledJobs(env) {
 
   // Signal discovery runs every 15 minutes, never more than one signal per scan,
   // and the separate D1 history enforces the 30/24h + 45-minute gap quota.
-  const signalScanDue = isSignalScanDue();
+  const signalDue = isSignalScanDue();
   console.log("SIGNAL SCAN CHECK", JSON.stringify({
-    due: signalScanDue,
+    due: signalDue,
     utcMinute: new Date().getUTCMinutes(),
     interval: Number(DEFAULTS.SIGNAL_SCAN_INTERVAL_MINUTES) || 15
   }));
 
-  if (signalScanDue) {
+  if (signalDue) {
     let okxTickers = null;
     try {
-      if (isEnabled(env, "SIGNALS_ENABLED", true)) {
-        okxTickers = await getOkxTickers(env);
-        console.log("OKX TICKER SNAPSHOT", JSON.stringify({ count: Array.isArray(okxTickers) ? okxTickers.length : 0 }));
-      } else {
-        console.log("SIGNAL SCAN SKIP", "SIGNALS_ENABLED=false");
-      }
+      if (isEnabled(env, "SIGNALS_ENABLED", true)) okxTickers = await getOkxTickers(env);
     } catch (error) {
       console.error("OKX TICKER SNAPSHOT ERROR", error);
     }
 
+    console.log("OKX TICKER SNAPSHOT", JSON.stringify({ count: Array.isArray(okxTickers) ? okxTickers.length : 0 }));
     try { await runSignalJob(env, okxTickers); } catch (error) { console.error("SIGNAL JOB ERROR", error); }
   }
 }
@@ -3098,7 +3124,13 @@ export class OkxMonitorDO extends DurableObject {
     this.subscribed = new Set();
     this.ws = null;
     this.wsConnecting = false;
+    this.reconnectTimer = null;
+    this.reconnectAttempts = 0;
+    this.heartbeatTimer = null;
+    this.lastWsMessageAt = Date.now();
     this.lastSyncAt = 0;
+    this.tickerCache = new Map();
+    this.tickersSubscribed = false;
     this.connectWebSocket();
     this.state.storage.setAlarm(Date.now() + 5 * 60 * 1000);
   }
@@ -3109,11 +3141,20 @@ export class OkxMonitorDO extends DurableObject {
       await this.syncPositions();
       return new Response("OK");
     }
+    if (url.pathname === "/tickers") {
+      const tickers = Array.from(this.tickerCache.values());
+      return new Response(JSON.stringify({
+        tickers,
+        count: tickers.length,
+        updatedAt: Date.now()
+      }), { headers: { "Content-Type": "application/json" } });
+    }
     if (url.pathname === "/status") {
       return new Response(JSON.stringify({
         websocket: !!this.ws && this.ws.readyState === WebSocket.OPEN,
         positions: this.positions.size,
         subscriptions: this.subscribed.size,
+        tickers: this.tickerCache.size,
         lastSyncAt: this.lastSyncAt
       }), { headers: { "Content-Type": "application/json" } });
     }
@@ -3124,6 +3165,7 @@ export class OkxMonitorDO extends DurableObject {
     try {
       await this.flushPositionsToD1();
       await this.syncPositions();
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectWebSocket();
     } catch (error) {
       console.error("OKX MONITOR ALARM ERROR", error);
     } finally {
@@ -3133,40 +3175,106 @@ export class OkxMonitorDO extends DurableObject {
 
   async connectWebSocket() {
     if (this.wsConnecting || (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING))) return;
+
     this.wsConnecting = true;
-    const url = getEnv(this.env, "OKX_WS_URL", "wss://ws.okx.com:8443/ws/v5/business");
+    const url = getEnv(this.env, "OKX_WS_URL", "wss://ws.okx.com/ws/v5/business");
+
     try {
       console.log("OKX MONITOR WS CONNECT", url);
       const ws = new WebSocket(url);
       this.ws = ws;
+
       ws.addEventListener("open", async () => {
         this.wsConnecting = false;
-        console.log("OKX MONITOR WS OPEN");
-        await this.reconcileSubscriptions(true);
+        this.reconnectAttempts = 0;
+        this.lastWsMessageAt = Date.now();
+        this.startHeartbeat();
+        console.log("OKX MONITOR WS OPEN", url);
+        try {
+          await this.reconcileSubscriptions(true);
+        } catch (error) {
+          console.error("OKX MONITOR WS SUBSCRIBE ERROR", error);
+        }
       });
+
       ws.addEventListener("message", async (event) => {
+        this.lastWsMessageAt = Date.now();
         await this.handleWsMessage(event.data);
       });
-      ws.addEventListener("close", () => {
+
+      ws.addEventListener("close", (event) => {
         this.wsConnecting = false;
-        this.ws = null;
+        this.stopHeartbeat();
+        if (this.ws === ws) this.ws = null;
         this.subscribed.clear();
-        console.warn("OKX MONITOR WS CLOSE");
-        this.state.storage.setAlarm(Date.now() + 5000);
-        this.connectWebSocket();
+        this.tickersSubscribed = false;
+        console.warn("OKX MONITOR WS CLOSE", JSON.stringify({code:event && event.code, reason:event && event.reason}));
+        this.scheduleReconnect();
       });
+
       ws.addEventListener("error", (error) => {
-        console.error("OKX MONITOR WS ERROR", error);
+        console.error("OKX MONITOR WS ERROR", {
+          type: error && error.type,
+          message: error && error.message,
+          readyState: ws.readyState
+        });
       });
     } catch (error) {
       this.wsConnecting = false;
+      this.stopHeartbeat();
       console.error("OKX MONITOR WS CONNECT ERROR", error);
-      this.state.storage.setAlarm(Date.now() + 5000);
+      this.scheduleReconnect();
     }
+  }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      try {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - this.lastWsMessageAt >= 25000) {
+          this.ws.send("ping");
+          console.log("OKX MONITOR WS HEARTBEAT");
+        }
+      } catch (error) {
+        console.error("OKX MONITOR WS HEARTBEAT ERROR", error);
+      }
+    }, 10000);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    const attempt = Math.min(this.reconnectAttempts || 0, 6);
+    const base = Math.min(60000, 2000 * Math.pow(2, attempt));
+    const jitter = Math.floor(Math.random() * 1000);
+    const delay = base + jitter;
+    this.reconnectAttempts = attempt + 1;
+    console.log("OKX MONITOR WS RECONNECT SCHEDULED", JSON.stringify({attempt:this.reconnectAttempts, delayMs:delay}));
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connectWebSocket();
+    }, delay);
   }
 
   async reconcileSubscriptions(forceAll) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+    if (!this.tickersSubscribed) {
+      this.ws.send(JSON.stringify({
+        op: "subscribe",
+        args: [{ channel: "tickers", instType: "SWAP" }]
+      }));
+      this.tickersSubscribed = true;
+      console.log("OKX MONITOR WS TICKERS SUBSCRIBED");
+    }
+
     const desired = new Set(this.positions.keys());
     const toSubscribe = [];
     for (const symbol of desired) {
@@ -3224,6 +3332,12 @@ export class OkxMonitorDO extends DurableObject {
         console.error("OKX MONITOR WS EVENT ERROR", message);
         return;
       }
+      if (message.arg && message.arg.channel === "tickers" && Array.isArray(message.data)) {
+        for (const ticker of message.data) {
+          if (ticker && ticker.instId) this.tickerCache.set(ticker.instId, ticker);
+        }
+        return;
+      }
       if (!message.data || !message.arg || message.arg.channel !== "candle5m") return;
       const symbol = message.arg.instId;
       if (!symbol || !this.positions.has(symbol)) return;
@@ -3251,16 +3365,31 @@ export class OkxMonitorDO extends DurableObject {
       pos.highest_price = Math.max(Number(pos.highest_price || pos.entry_mid), high);
     }
 
-    const reached = [];
     const hits = [
       ["TP1", "tp1_hit", Number(pos.tp1_price)],
       ["TP2", "tp2_hit", Number(pos.tp2_price)],
       ["TP3", "tp3_hit", Number(pos.tp3_price)]
     ];
+    const reached = [];
+
     for (const item of hits) {
       if (Number(pos[item[1]] || 0)) continue;
       const hit = pos.direction === "LONG" ? high >= item[2] : low <= item[2];
-      if (hit) {
+      if (!hit) continue;
+
+      let claimed = false;
+      try {
+        const result = await this.env.DB.prepare(`
+          UPDATE signal_positions
+          SET ${item[1]} = 1, updated_at = datetime('now')
+          WHERE id = ? AND status = 'OPEN' AND ${item[1]} = 0
+        `).bind(Number(pos.id)).run();
+        claimed = Number(result && result.meta && result.meta.changes || 0) === 1;
+      } catch (error) {
+        console.error("OKX TP CLAIM ERROR", symbol, item[0], error);
+      }
+
+      if (claimed) {
         pos[item[1]] = 1;
         reached.push({ name: item[0], price: item[2] });
       }
@@ -3275,8 +3404,10 @@ export class OkxMonitorDO extends DurableObject {
         "💰 Price: `" + fmt(hit.price) + "`\n" +
         "📈 Profit: *+" + profit.toFixed(1) + "%*" + extra;
       if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
-      await this.persistPosition(pos);
     }
+
+    // Persist price extremes even when no target was hit.
+    await this.persistPosition(pos);
 
     let effectiveStop = Number(pos.sl_price);
     if (wasTp1Hit) effectiveStop = Number(pos.entry_mid);
@@ -3294,10 +3425,24 @@ export class OkxMonitorDO extends DurableObject {
 
     const stopHit = pos.direction === "LONG" ? low <= effectiveStop : high >= effectiveStop;
     if (stopHit && (wasTp1Hit || tp3Hit) && !tp3JustHit) {
+      const closeClaim = await this.env.DB.prepare(`
+        UPDATE signal_positions
+        SET status='CLOSING', updated_at=datetime('now')
+        WHERE id=? AND status='OPEN'
+      `).bind(Number(pos.id)).run();
+      const claimedClose = Number(closeClaim && closeClaim.meta && closeClaim.meta.changes || 0) === 1;
+      if (!claimedClose) return;
+
+      pos.status = "CLOSING";
+      this.positions.delete(symbol);
+      await this.reconcileSubscriptions(false);
+
       const entry = Number(pos.entry_mid);
       const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
       const highestProfit = Math.max(0, Math.abs((peak - entry) / entry) * 1000);
-      const targetStatus = ["TP1", "TP2", "TP3"].filter((_, i) => Number(pos["tp" + (i + 1) + "_hit"] || 0)).map(x => x + " ✅").join("   ");
+      const targetStatus = ["TP1", "TP2", "TP3"]
+        .filter((_, i) => Number(pos["tp" + (i + 1) + "_hit"] || 0))
+        .map(x => x + " ✅").join("   ");
       const msg = "🔒 *SIGNAL CLOSED*\n\n" +
         "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
         "🏆 Highest Profit: *+" + highestProfit.toFixed(1) + "%*\n" +
@@ -3305,11 +3450,11 @@ export class OkxMonitorDO extends DurableObject {
         targetStatus + "\n\n" +
         "🔒 Position Closed at Peak\n" +
         "📊 Closed Profit: *+" + highestProfit.toFixed(1) + "%*";
-      if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
-      pos.status = "CLOSED";
-      await this.persistPosition(pos);
-      this.positions.delete(symbol);
-      await this.reconcileSubscriptions(false);
+      try {
+        if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
+      } finally {
+        await this.env.DB.prepare(`UPDATE signal_positions SET status='CLOSED', updated_at=datetime('now') WHERE id=? AND status='CLOSING'`).bind(Number(pos.id)).run();
+      }
       return;
     }
   }
