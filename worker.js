@@ -120,6 +120,11 @@ const INTERESTS = {
   }
 };
 
+// D1 schema is stable after deployment. Cache the initialization per Worker isolate
+// so every Telegram message does NOT execute 9+ CREATE/INDEX statements again.
+let schemaReady = false;
+let schemaPromise = null;
+
 /* ============================================================
    CLOUDFLARE ENTRY
 ============================================================ */
@@ -2499,11 +2504,12 @@ async function buildOkxSetup(ticker) {
           (direction === "SHORT" && change24h < 0)) score += 10;
     }
 
-    // Entry, SL, TP and score logic below are intentionally unchanged.
+    // Entry is a practical area around the current market price.
     const entryLow = price * 0.999;
     const entryHigh = price * 1.001;
     const entryMid = (entryLow + entryHigh) / 2;
 
+    // Structural SL is retained from the existing scanner logic.
     let sl;
     if (direction === "LONG") {
       sl = recentLow < price ? recentLow : price * 0.995;
@@ -2513,6 +2519,10 @@ async function buildOkxSetup(ticker) {
       if (!(sl > entryMid)) return null;
     }
 
+    // 10X leverage: targets are opportunity-based, not fixed.
+    // Allowed displayed P&L bands:
+    // TP1 = 15–20%, TP2 = 30–35%, TP3 = 60–65%.
+    // Stronger setups/volatility move toward the upper end of each band.
     const scoreOpportunity = Math.max(0, Math.min(1, (score - 40) / 55));
     const volatilityOpportunity = Number.isFinite(change24h)
       ? Math.max(0, Math.min(1, Math.abs(change24h) / 10))
@@ -2537,11 +2547,7 @@ async function buildOkxSetup(ticker) {
       tp3 = entryMid * (1 - targetMoves[2]);
     }
 
-    // NEW: setup detection is now multi-timeframe only. The existing 15M
-    // signal direction, entry, SL, TP and score logic above is untouched.
-    const mtfSetup = await detectMultiTimeframeTradeSetup(symbol, direction, closes, highs, lows);
-    const tradeSetup = mtfSetup ? mtfSetup.name : detectTradeSetup(closes, highs, lows, direction);
-    const setupTimeframe = mtfSetup ? mtfSetup.timeframe : "15M";
+    const tradeSetup = detectTradeSetup(closes, highs, lows, direction);
     const rawCoin = symbol.replace("-USDT-SWAP", "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
 
     return {
@@ -2569,219 +2575,12 @@ async function buildOkxSetup(ticker) {
       change24h: Number.isFinite(change24h) ? fmt(change24h) : "n/a",
       volume: fmt(volumeRatio) + "x avg",
       tradeSetup: tradeSetup,
-      timeframe: setupTimeframe,
+      timeframe: "15M",
       score: score
     };
   } catch (error) {
     return null;
   }
-}
-
-async function fetchOkxCandlesForSetup(symbol, timeframe) {
-  try {
-    const limit = timeframe === "4H" ? 100 : 80;
-    const bar = timeframe === "1H" ? "1H" : timeframe === "4H" ? "4H" : timeframe === "5M" ? "5m" : "15m";
-    const url =
-      "https://www.okx.com/api/v5/market/candles?instId=" +
-      encodeURIComponent(symbol) + "&bar=" + bar + "&limit=" + limit;
-    const response = await fetch(url);
-    if (!response.ok) return null;
-    const payload = await response.json();
-    const candles = Array.isArray(payload.data) ? payload.data.slice().reverse() : [];
-    if (candles.length < 35) return null;
-    return {
-      closes: candles.map(function(c) { return Number(c[4]); }),
-      highs: candles.map(function(c) { return Number(c[2]); }),
-      lows: candles.map(function(c) { return Number(c[3]); }),
-      volumes: candles.map(function(c) { return Number(c[5]); })
-    };
-  } catch (error) {
-    return null;
-  }
-}
-
-async function detectMultiTimeframeTradeSetup(symbol, direction, closes15, highs15, lows15) {
-  const timeframes = ["4H", "1H", "15M", "5M"];
-  const results = [];
-
-  // Reuse the already-fetched 15M candles; only 5M/1H/4H require new requests.
-  const dataByTf = {
-    "15M": { closes: closes15, highs: highs15, lows: lows15 }
-  };
-
-  const fetched = await Promise.all([
-    fetchOkxCandlesForSetup(symbol, "5M"),
-    fetchOkxCandlesForSetup(symbol, "1H"),
-    fetchOkxCandlesForSetup(symbol, "4H")
-  ]);
-  dataByTf["5M"] = fetched[0];
-  dataByTf["1H"] = fetched[1];
-  dataByTf["4H"] = fetched[2];
-
-  for (const timeframe of timeframes) {
-    const data = dataByTf[timeframe];
-    if (!data) continue;
-    const found = detectAdvancedTradeSetup(data.closes, data.highs, data.lows, direction);
-    if (found) results.push({ name: found.name, score: found.score, timeframe: timeframe });
-  }
-
-  if (!results.length) return null;
-
-  // Prefer the strongest confirmed chart pattern. If scores are equal, prefer
-  // the lower timeframe because the signal is intended for an entry setup.
-  const rank = { "5M": 1, "15M": 2, "1H": 3, "4H": 4 };
-  results.sort(function(a, b) {
-    if (b.score !== a.score) return b.score - a.score;
-    return rank[a.timeframe] - rank[b.timeframe];
-  });
-  return results[0];
-}
-
-function detectAdvancedTradeSetup(closes, highs, lows, direction) {
-  const n = closes.length;
-  if (n < 35) return null;
-
-  const last = closes[n - 1];
-  const prev = closes[n - 2];
-  const recentHigh = Math.max.apply(null, highs.slice(-12));
-  const recentLow = Math.min.apply(null, lows.slice(-12));
-  const priorHigh = Math.max.apply(null, highs.slice(-24, -12));
-  const priorLow = Math.min.apply(null, lows.slice(-24, -12));
-  const range = Math.max.apply(null, highs.slice(-12)) - Math.min.apply(null, lows.slice(-12));
-  const base = Math.max(Math.abs(last), 1e-12);
-  const tolerance = 0.012;
-
-  // 1) Breakout / breakdown and retest.
-  if (direction === "LONG" && last > priorHigh && prev <= priorHigh) {
-    return { name: "Bullish Breakout", score: 100 };
-  }
-  if (direction === "SHORT" && last < priorLow && prev >= priorLow) {
-    return { name: "Bearish Breakdown", score: 100 };
-  }
-
-  // 2) Head & Shoulders / Inverse Head & Shoulders.
-  const h = localExtrema(highs, 8, true);
-  const l = localExtrema(lows, 8, false);
-  if (direction === "SHORT" && h.length >= 3) {
-    const a = h[h.length - 3], b = h[h.length - 2], c = h[h.length - 1];
-    if (b.value > a.value * 1.012 && b.value > c.value * 1.012 && Math.abs(a.value - c.value) / Math.max(a.value, c.value) < 0.035) {
-      return { name: "Head & Shoulders", score: 98 };
-    }
-  }
-  if (direction === "LONG" && l.length >= 3) {
-    const a = l[l.length - 3], b = l[l.length - 2], c = l[l.length - 1];
-    if (b.value < a.value * 0.988 && b.value < c.value * 0.988 && Math.abs(a.value - c.value) / Math.max(a.value, c.value) < 0.035) {
-      return { name: "Inverse Head & Shoulders", score: 98 };
-    }
-  }
-
-  // 3) Double / triple top-bottom.
-  const recentLows = localExtrema(lows, 6, false);
-  const recentHighs = localExtrema(highs, 6, true);
-  if (direction === "LONG" && recentLows.length >= 3) {
-    const a = recentLows[recentLows.length - 3], b = recentLows[recentLows.length - 2], c = recentLows[recentLows.length - 1];
-    if (Math.abs(a.value - c.value) / Math.max(a.value, c.value) < tolerance && b.value >= Math.min(a.value, c.value) * 0.995) {
-      return { name: "Triple Bottom", score: 94 };
-    }
-  }
-  if (direction === "SHORT" && recentHighs.length >= 3) {
-    const a = recentHighs[recentHighs.length - 3], b = recentHighs[recentHighs.length - 2], c = recentHighs[recentHighs.length - 1];
-    if (Math.abs(a.value - c.value) / Math.max(a.value, c.value) < tolerance && b.value <= Math.max(a.value, c.value) * 1.005) {
-      return { name: "Triple Top", score: 94 };
-    }
-  }
-  if (direction === "LONG" && recentLows.length >= 2) {
-    const a = recentLows[recentLows.length - 2], b = recentLows[recentLows.length - 1];
-    if (Math.abs(a.value - b.value) / Math.max(a.value, b.value) < 0.008) return { name: "Double Bottom", score: 90 };
-  }
-  if (direction === "SHORT" && recentHighs.length >= 2) {
-    const a = recentHighs[recentHighs.length - 2], b = recentHighs[recentHighs.length - 1];
-    if (Math.abs(a.value - b.value) / Math.max(a.value, b.value) < 0.008) return { name: "Double Top", score: 90 };
-  }
-
-  // 4) Flags and pennants.
-  const short = closes.slice(-10);
-  const first = short[0], mid = short[Math.floor(short.length / 2)], end = short[short.length - 1];
-  const consolidation = Math.abs(end - mid) / base < 0.018;
-  const flagSlope = (mid - first) / Math.max(Math.abs(first), 1e-12);
-  if (direction === "LONG" && consolidation && flagSlope > 0.025) {
-    const tightening = recentRange(highs.slice(-5), lows.slice(-5)) < recentRange(highs.slice(-10), lows.slice(-10));
-    return { name: tightening ? "Bullish Pennant" : "Bullish Flag", score: tightening ? 88 : 86 };
-  }
-  if (direction === "SHORT" && consolidation && flagSlope < -0.025) {
-    const tightening = recentRange(highs.slice(-5), lows.slice(-5)) < recentRange(highs.slice(-10), lows.slice(-10));
-    return { name: tightening ? "Bearish Pennant" : "Bearish Flag", score: tightening ? 88 : 86 };
-  }
-
-  // 5) Triangles / wedges from shrinking recent range.
-  const oldRange = recentRange(highs.slice(-16, -8), lows.slice(-16, -8));
-  const newRange = recentRange(highs.slice(-8), lows.slice(-8));
-  const shrinking = oldRange > 0 && newRange < oldRange * 0.78;
-  const highOld = linearSlope(highs.slice(-16, -8));
-  const highNew = linearSlope(highs.slice(-8));
-  const lowOld = linearSlope(lows.slice(-16, -8));
-  const lowNew = linearSlope(lows.slice(-8));
-  if (shrinking) {
-    if (direction === "LONG" && lowNew > 0 && highNew < 0) return { name: "Symmetrical Triangle", score: 84 };
-    if (direction === "LONG" && lowNew > 0 && Math.abs(highNew) < Math.abs(lowNew) * 0.45) return { name: "Ascending Triangle", score: 84 };
-    if (direction === "SHORT" && highNew < 0 && Math.abs(lowNew) < Math.abs(highNew) * 0.45) return { name: "Descending Triangle", score: 84 };
-    if (direction === "LONG" && highNew < 0 && lowNew < 0) return { name: "Falling Wedge", score: 82 };
-    if (direction === "SHORT" && highNew > 0 && lowNew > 0) return { name: "Rising Wedge", score: 82 };
-  }
-
-  // 6) Rectangle / channel breakout.
-  const hiBand = Math.max.apply(null, highs.slice(-16));
-  const loBand = Math.min.apply(null, lows.slice(-16));
-  const band = hiBand - loBand;
-  if (band > 0) {
-    const touchesHigh = highs.slice(-16).filter(function(v) { return Math.abs(v - hiBand) / band < 0.08; }).length;
-    const touchesLow = lows.slice(-16).filter(function(v) { return Math.abs(v - loBand) / band < 0.08; }).length;
-    if (touchesHigh >= 2 && touchesLow >= 2) {
-      if (direction === "LONG" && last > hiBand * 0.998) return { name: "Rectangle Breakout", score: 80 };
-      if (direction === "SHORT" && last < loBand * 1.002) return { name: "Rectangle Breakdown", score: 80 };
-    }
-  }
-
-  // 7) Cup & Handle / rounding patterns (conservative heuristic).
-  if (closes.length >= 30) {
-    const q = closes.slice(-30);
-    const left = Math.max.apply(null, q.slice(0, 8));
-    const center = Math.min.apply(null, q.slice(10, 20));
-    const right = Math.max.apply(null, q.slice(22, 30));
-    if (direction === "LONG" && center < left * 0.94 && Math.abs(right - left) / left < 0.05 && last >= right * 0.985) {
-      return { name: "Cup & Handle", score: 78 };
-    }
-  }
-
-  // No advanced pattern on this timeframe. The caller will keep the existing
-  // 15M setup detector as the final fallback, so we never label a generic
-  // movement as a new pattern or fake a timeframe.
-  return null;
-}
-
-function localExtrema(values, window, wantHigh) {
-  const out = [];
-  for (let i = window; i < values.length - window; i++) {
-    let ok = true;
-    for (let j = i - window; j <= i + window; j++) {
-      if (j === i) continue;
-      if (wantHigh ? values[i] < values[j] : values[i] > values[j]) { ok = false; break; }
-    }
-    if (ok) out.push({ index: i, value: values[i] });
-  }
-  return out;
-}
-
-function recentRange(highs, lows) {
-  if (!highs.length || !lows.length) return 0;
-  return Math.max.apply(null, highs) - Math.min.apply(null, lows);
-}
-
-function linearSlope(values) {
-  if (values.length < 2) return 0;
-  const first = values[0];
-  const last = values[values.length - 1];
-  return (last - first) / Math.max(Math.abs(first), 1e-12);
 }
 
 function detectTradeSetup(closes, highs, lows, direction) {
@@ -3058,102 +2857,115 @@ async function handleAdminCommand(chatId, text, env) {
 
 async function ensureSchema(env) {
   if (!env.DB) return;
+  if (schemaReady) return;
+  if (schemaPromise) return schemaPromise;
 
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS users (
-      telegram_id INTEGER PRIMARY KEY,
-      first_name TEXT,
-      username TEXT,
-      language TEXT,
-      interest TEXT,
-      capital TEXT,
-      trading_type TEXT,
-      experience TEXT,
-      market TEXT,
-      requirement TEXT,
-      lead_status TEXT DEFAULT 'new',
-      followup_status TEXT DEFAULT 'active',
-      last_followup_day INTEGER DEFAULT 0,
-      joined_community INTEGER DEFAULT 0,
-      team_referred TEXT,
-      created_at TEXT,
-      last_interaction TEXT
-    )`,
+  schemaPromise = (async () => {
+    if (!env.DB) return;
 
-    `CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      telegram_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`,
+    const statements = [
+      `CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY,
+        first_name TEXT,
+        username TEXT,
+        language TEXT,
+        interest TEXT,
+        capital TEXT,
+        trading_type TEXT,
+        experience TEXT,
+        market TEXT,
+        requirement TEXT,
+        lead_status TEXT DEFAULT 'new',
+        followup_status TEXT DEFAULT 'active',
+        last_followup_day INTEGER DEFAULT 0,
+        joined_community INTEGER DEFAULT 0,
+        team_referred TEXT,
+        created_at TEXT,
+        last_interaction TEXT
+      )`,
 
-    `CREATE INDEX IF NOT EXISTS idx_users_interest
-      ON users(interest)`,
+      `CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )`,
 
-    `CREATE INDEX IF NOT EXISTS idx_messages_user
-      ON messages(telegram_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_users_interest
+        ON users(interest)`,
 
-    `CREATE INDEX IF NOT EXISTS idx_users_status
-      ON users(lead_status)`,
+      `CREATE INDEX IF NOT EXISTS idx_messages_user
+        ON messages(telegram_id)`,
 
-    `CREATE TABLE IF NOT EXISTS bot_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT,
-      updated_at TEXT
-    )`,
+      `CREATE INDEX IF NOT EXISTS idx_users_status
+        ON users(lead_status)`,
 
-    `CREATE TABLE IF NOT EXISTS signal_history (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT NOT NULL,
-      pair TEXT NOT NULL,
-      direction TEXT NOT NULL,
-      channel_message_id INTEGER,
-      sent_at TEXT NOT NULL
-    )`,
+      `CREATE TABLE IF NOT EXISTS bot_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TEXT
+      )`,
 
-    `CREATE TABLE IF NOT EXISTS signal_positions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      symbol TEXT NOT NULL,
-      pair TEXT NOT NULL,
-      direction TEXT NOT NULL,
-      entry_mid REAL NOT NULL,
-      sl_price REAL NOT NULL,
-      tp1_price REAL NOT NULL,
-      tp2_price REAL NOT NULL,
-      tp3_price REAL NOT NULL,
-      tp1_hit INTEGER DEFAULT 0,
-      tp2_hit INTEGER DEFAULT 0,
-      tp3_hit INTEGER DEFAULT 0,
-      highest_price REAL,
-      lowest_price REAL,
-      status TEXT DEFAULT 'OPEN',
-      channel_message_id INTEGER,
-      created_at TEXT,
-      updated_at TEXT
-    )`,
+      `CREATE TABLE IF NOT EXISTS signal_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        pair TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        channel_message_id INTEGER,
+        sent_at TEXT NOT NULL
+      )`,
 
-    `CREATE TABLE IF NOT EXISTS signal_event_guard (
-      event_key TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`
-  ];
+      `CREATE TABLE IF NOT EXISTS signal_positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        pair TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        entry_mid REAL NOT NULL,
+        sl_price REAL NOT NULL,
+        tp1_price REAL NOT NULL,
+        tp2_price REAL NOT NULL,
+        tp3_price REAL NOT NULL,
+        tp1_hit INTEGER DEFAULT 0,
+        tp2_hit INTEGER DEFAULT 0,
+        tp3_hit INTEGER DEFAULT 0,
+        highest_price REAL,
+        lowest_price REAL,
+        status TEXT DEFAULT 'OPEN',
+        channel_message_id INTEGER,
+        created_at TEXT,
+        updated_at TEXT
+      )`,
 
-  for (const sql of statements) {
-    try {
-      await env.DB.prepare(sql).run();
-    } catch (error) {
-      console.error("D1 SCHEMA ERROR", error && error.message ? error.message : error);
+      `CREATE TABLE IF NOT EXISTS signal_event_guard (
+        event_key TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`
+    ];
+
+    for (const sql of statements) {
+      try {
+        await env.DB.prepare(sql).run();
+      } catch (error) {
+        console.error("D1 SCHEMA ERROR", error && error.message ? error.message : error);
+      }
     }
-  }
 
-  // Backward-compatible columns for older deployments.
-  for (const column of ["requirement TEXT", "last_followup_day INTEGER DEFAULT 0"]) {
-    try {
-      await env.DB.prepare("ALTER TABLE users ADD COLUMN " + column).run();
-    } catch (error) {
-      // Expected if the column already exists.
+    // Backward-compatible columns for older deployments.
+    for (const column of ["requirement TEXT", "last_followup_day INTEGER DEFAULT 0"]) {
+      try {
+        await env.DB.prepare("ALTER TABLE users ADD COLUMN " + column).run();
+      } catch (error) {
+        // Expected if the column already exists.
+      }
     }
+  })();
+
+  try {
+    await schemaPromise;
+    schemaReady = true;
+  } finally {
+    schemaPromise = null;
   }
 }
 
