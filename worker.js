@@ -2849,6 +2849,9 @@ function isAdmin(userId, env) {
 function isAdminCommand(text) {
   const commands = [
     "/status",
+    "/positions",
+    "/pnl",
+    "/openpositions",
     "/news_on",
     "/news_off",
     "/signals_on",
@@ -2860,8 +2863,108 @@ function isAdminCommand(text) {
   return commands.indexOf(String(text || "").toLowerCase()) >= 0;
 }
 
+async function getOpenPositionsReport(env) {
+  if (!env.DB) return "❌ D1 database is not available.";
+
+  const result = await env.DB.prepare(`
+    SELECT id, symbol, pair, direction, entry_mid, sl_price, tp1_price, tp2_price, tp3_price,
+           tp1_hit, tp2_hit, tp3_hit, created_at
+    FROM signal_positions
+    WHERE status = 'OPEN'
+    ORDER BY id ASC
+    LIMIT 50
+  `).all();
+
+  const positions = result && result.results ? result.results : [];
+  if (!positions.length) {
+    return "📊 *OPEN SIGNAL POSITIONS*\n\nNo open positions right now.";
+  }
+
+  const lines = [
+    "📊 *OPEN SIGNAL POSITIONS*",
+    "",
+    "Open: *" + positions.length + "*",
+    ""
+  ];
+
+  let totalPnl = 0;
+  let pricedCount = 0;
+
+  for (let i = 0; i < positions.length; i++) {
+    const pos = positions[i];
+    let current = NaN;
+
+    try {
+      const url =
+        "https://www.okx.com/api/v5/market/ticker?instId=" +
+        encodeURIComponent(pos.symbol);
+      const response = await fetch(url, {
+        method: "GET",
+        headers: { "Accept": "application/json" }
+      });
+      if (response.ok) {
+        const payload = await response.json();
+        const ticker = Array.isArray(payload.data) ? payload.data[0] : null;
+        current = Number(ticker && ticker.last);
+      }
+    } catch (error) {
+      console.error("OPEN POSITIONS PRICE ERROR", pos.symbol, error);
+    }
+
+    const entry = Number(pos.entry_mid);
+    let pnl = NaN;
+    if (entry > 0 && current > 0) {
+      pnl = pos.direction === "LONG"
+        ? ((current - entry) / entry) * 100
+        : ((entry - current) / entry) * 100;
+      totalPnl += pnl;
+      pricedCount++;
+    }
+
+    const pnlText = Number.isFinite(pnl)
+      ? ((pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "%")
+      : "Price unavailable";
+
+    const hitText = [
+      Number(pos.tp1_hit) ? "TP1" : "",
+      Number(pos.tp2_hit) ? "TP2" : "",
+      Number(pos.tp3_hit) ? "TP3" : ""
+    ].filter(Boolean).join(", ");
+
+    lines.push(
+      (i + 1) + ". *" + String(pos.pair || pos.symbol) + "* — *" + String(pos.direction) + "*",
+      "Entry: `" + entry + "`",
+      "Current: `" + (Number.isFinite(current) ? current : "N/A") + "`",
+      "P/L Move: *" + pnlText + "*" + (hitText ? " — " + hitText + " hit" : ""),
+      "SL: `" + Number(pos.sl_price) + "` | TP3: `" + Number(pos.tp3_price) + "`",
+      ""
+    );
+  }
+
+  if (pricedCount) {
+    lines.push(
+      "━━━━━━━━━━━━━━",
+      "Total P/L Move: *" + (totalPnl >= 0 ? "+" : "") + totalPnl.toFixed(2) + "%*",
+      "\n_This is signal price-move P/L, not a broker/account P&L._"
+    );
+  }
+
+  return lines.join("\n");
+}
+
 async function handleAdminCommand(chatId, text, env) {
   const command = String(text || "").toLowerCase();
+
+  if (command === "/positions" || command === "/pnl" || command === "/openpositions") {
+    try {
+      const report = await getOpenPositionsReport(env);
+      await sendTelegram(env, chatId, report);
+    } catch (error) {
+      console.error("OPEN POSITIONS REPORT ERROR", error);
+      await sendTelegram(env, chatId, "❌ Could not load open positions right now.");
+    }
+    return;
+  }
 
   if (command === "/status") {
     await sendTelegram(
