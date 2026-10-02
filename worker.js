@@ -2289,7 +2289,8 @@ async function monitorOpenSignals(env, tickers) {
       if (Number(closeClaim?.meta?.changes || 0) !== 1) continue;
 
       const msg = anyTp
-        ? "🔒 *SIGNAL CLOSED*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 Closed Price: `" + reportFmt(closePrice) + "`\n📊 Profit: *+" + peakPct.toFixed(1) + "%*\n\n🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n🏆 Highest Profit: *+" + peakPct.toFixed(1) + "%*\n\n🎯 TP1 " + (tp1Hit?"✅":"❌") + "   TP2 " + (tp2Hit?"✅":"❌") + "   TP3 " + (tp3Hit?"✅":"❌")\n        : "😔 *SL HIT*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 SL Price: `" + reportFmt(closePrice) + "`\n📉 Loss: *" + (realizedAtClose >= 0 ? "+" : "") + realizedAtClose.toFixed(1) + "%*\n\n🔒 Position Closed";
+        ? "🔒 *SIGNAL CLOSED*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 Closed Price: `" + reportFmt(closePrice) + "`\n📊 Profit: *+" + peakPct.toFixed(1) + "%*\n\n🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n🏆 Highest Profit: *+" + peakPct.toFixed(1) + "%*\n\n🎯 TP1 " + (tp1Hit?"✅":"❌") + "   TP2 " + (tp2Hit?"✅":"❌") + "   TP3 " + (tp3Hit?"✅":"❌")
+        : "😔 *SL HIT*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 SL Price: `" + reportFmt(closePrice) + "`\n📉 Loss: *" + (realizedAtClose >= 0 ? "+" : "") + realizedAtClose.toFixed(1) + "%*\n\n🔒 Position Closed";
       try {
         if (pos.channel_message_id) await sendTelegramReply(env, msg, pos.channel_message_id);
       } finally {
