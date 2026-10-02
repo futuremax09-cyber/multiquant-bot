@@ -31,7 +31,8 @@ name = "OKX_MONITOR"
 class_name = "OkxMonitorDO"
 
 [exports.OkxMonitorDO]
-type = "sqlite"
+type = "durable-object"
+storage = "sqlite"
 
 [triggers]
 crons = ["*/5 * * * *"]
