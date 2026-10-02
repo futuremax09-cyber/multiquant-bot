@@ -753,7 +753,11 @@ async function sendQualificationStep(env, chatId, userId, user) {
 function buildShortSalesAnswerPrompt(user, latest) {
   return `
 You are the concise sales assistant for MultiQuant Academy.
-Answer the user's CURRENT question first, in the same language/style as the user.
+Answer the user's CURRENT question first, in exactly the same language/style as the user's latest message.
+If the user writes Roman Hindi/Hinglish, reply in natural Roman Hinglish — NEVER switch to English unless the user switches to English.
+If the user writes Hindi in Devanagari, reply in natural Hindi Devanagari.
+If the user writes English, reply in natural English.
+Do not translate or rewrite the user's style into another language.
 Do not restart qualification. Do not ask a new question in your answer.
 Do not invent prices, deposits, ROI, profits, performance, testimonials or availability.
 If the exact commercial fact is unknown, say the team can confirm it.
@@ -800,6 +804,7 @@ function buildPostQualificationPrompt(user, latest) {
 You are the personal sales consultant for MultiQuant Academy.
 
 Language: ${languageInstruction(user.language)}
+STRICT LANGUAGE RULE: Match the user's latest message. Roman Hindi/Hinglish must stay Roman Hinglish; do not answer it in English or Devanagari.
 
 The lead is ALREADY QUALIFIED.
 Do NOT restart qualification.
@@ -855,18 +860,9 @@ async function generateGemini(env, prompt) {
     return "I’m temporarily unable to connect to the AI service. Please try again shortly.";
   }
 
-  const primaryModel = getEnv(env, "GEMINI_MODEL", DEFAULTS.GEMINI_MODEL);
-  const fallbackModel1 = getEnv(env, "GEMINI_FALLBACK_MODEL", "gemini-3.7-flash");
-  const fallbackModel2 = getEnv(env, "GEMINI_FALLBACK_MODEL_2", "gemini-3.5-flash");
-  const fallbackModel3 = getEnv(env, "GEMINI_FALLBACK_MODEL_3", "gemini-3.1-flash-lite");
-  const models = [
-    primaryModel,
-    fallbackModel1,
-    fallbackModel2,
-    fallbackModel3
-  ].filter((model, index, list) =>
-    model && list.indexOf(model) === index
-  );
+  // Final production model: Gemini 3.1 Flash-Lite only.
+  // Keeping a single model avoids multi-model retry delays when quota is exhausted.
+  const models = [getEnv(env, "GEMINI_MODEL", "gemini-3.1-flash-lite")];
 
   const requestBody = {
     system_instruction: {
@@ -881,7 +877,7 @@ async function generateGemini(env, prompt) {
       parts: [{ text: prompt }]
     }],
     generationConfig: {
-      maxOutputTokens: 500
+      maxOutputTokens: 350
     }
   };
 
@@ -1351,30 +1347,14 @@ function detectLanguage(text) {
   const lower = value.toLowerCase();
 
   const hinglishWords = [
-    "bhai",
-    "hai",
-    "kya",
-    "kaise",
-    "mujhe",
-    "aap",
-    "apna",
-    "chahiye",
-    "karna",
-    "krna",
-    "nahi",
-    "haan",
-    "acha",
-    "accha",
-    "kitna",
-    "paisa",
-    "lakh",
-    "crore",
-    "mere",
-    "pass",
-    "batao",
-    "btao",
-    "karo",
-    "kru"
+    "bhai", "yaar", "yar", "hai", "h", "kya", "kyo", "kyu", "kyun",
+    "kaise", "kaisa", "mujhe", "mujh", "aap", "apna", "apne", "chahiye",
+    "karna", "krna", "karta", "krta", "kar", "kr", "nahi", "nahin",
+    "haan", "ha", "acha", "accha", "theek", "thik", "kitna", "kitne",
+    "paisa", "paise", "lakh", "crore", "mere", "mera", "meri", "pass",
+    "batao", "btao", "batana", "bta", "kaho", "bolo", "bol", "bolna",
+    "karo", "kru", "kya", "hua", "gya", "gaya", "rha", "raha", "rhi",
+    "rahi", "krta", "krdiya", "diya", "de", "do", "lagega", "lagta"
   ];
 
   let hits = 0;
