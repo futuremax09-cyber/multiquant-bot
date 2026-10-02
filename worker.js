@@ -1947,7 +1947,7 @@ async function runSignalJob(env, tickers) {
     });
 
     const setups = [];
-    const maxCandidates = Math.min(usdt.length, 5);
+    const maxCandidates = Math.min(usdt.length, 20);
 
     for (let i = 0; i < maxCandidates; i++) {
       const setup = await buildOkxSetup(usdt[i]);
