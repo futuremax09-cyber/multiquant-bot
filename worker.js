@@ -2361,10 +2361,13 @@ async function monitorOpenSignals(env, tickers) {
        */
       let effectiveStop = Number(pos.sl_price);
 
+      // After TP1, protect the trade at entry.
       if (tp1Hit) {
         effectiveStop = Number(pos.entry_mid);
       }
 
+      // After TP3, keep the position open and trail 20% of the maximum
+      // favorable move (i.e. protect 80% of the move).
       if (tp3Hit) {
         const entry = Number(pos.entry_mid);
 
@@ -2377,22 +2380,30 @@ async function monitorOpenSignals(env, tickers) {
         }
       }
 
-      // For a 5m candle, use its range for stop/reversal detection too.
-      // This prevents missing a reversal that happened inside the interval.
       const stopHit = pos.direction === "LONG"
         ? candleLow <= effectiveStop
         : candleHigh >= effectiveStop;
 
-      if (stopHit && tp1Hit) {
-        const closePct = Math.max(0, Number(favorablePct)).toFixed(1);
+      // A TP3 hit is a milestone, not an exit. If the same candle first
+      // reaches TP3 and also crosses the new trailing stop, do not close
+      // immediately because candle OHLC cannot prove the intrabar order.
+      const tp3JustHit = reached.includes("TP3");
+
+      if (stopHit && tp3Hit && !tp3JustHit) {
+        const closePrice = effectiveStop;
+        const closePct = pos.direction === "LONG"
+          ? ((closePrice - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
+          : ((Number(pos.entry_mid) - closePrice) / Number(pos.entry_mid)) * 1000;
 
         const msg =
           "🔒 *SIGNAL CLOSED*\n\n" +
           "📌 " + pos.pair + " — " + pos.direction + "\n" +
-          "🏆 Highest Profit: *+" + closePct + "%*\n\n" +
+          "💰 Closed Price: `" + closePrice + "`\n" +
+          "📊 Profit: *" + (closePct >= 0 ? "+" : "") + closePct.toFixed(1) + "%*\n\n" +
           "TP1 " + (tp1Hit ? "✅" : "❌") +
           "   TP2 " + (tp2Hit ? "✅" : "❌") +
-          "   TP3 " + (tp3Hit ? "✅" : "❌");
+          "   TP3 " + (tp3Hit ? "✅" : "❌") +
+          "\n\n🏆 Highest Favorable Price: `" + favorablePrice + "`";
 
         if (pos.channel_message_id) {
           const sent = await sendTelegramReply(env, msg, pos.channel_message_id);
@@ -2409,14 +2420,42 @@ async function monitorOpenSignals(env, tickers) {
               lowest_price=?,
               updated_at=datetime('now')
           WHERE id=?
-        `).bind(
-          tp1Hit,
-          tp2Hit,
-          tp3Hit,
-          highest,
-          lowest,
-          pos.id
-        ).run();
+        `).bind(tp1Hit, tp2Hit, tp3Hit, highest, lowest, pos.id).run();
+
+        continue;
+      }
+
+      // Direct SL before any TP: close immediately and report the actual
+      // SL-trigger price and corresponding 10X price-move loss.
+      if (stopHit && !tp1Hit && !tp2Hit && !tp3Hit) {
+        const closePrice = Number(pos.sl_price);
+        const lossPct = pos.direction === "LONG"
+          ? ((closePrice - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
+          : ((Number(pos.entry_mid) - closePrice) / Number(pos.entry_mid)) * 1000;
+
+        const msg =
+          "😔 *SL HIT*\n\n" +
+          "📌 " + pos.pair + " — " + pos.direction + "\n" +
+          "💰 SL Price: `" + closePrice + "`\n" +
+          "📉 Loss: *" + lossPct.toFixed(1) + "%*\n\n" +
+          "🔒 Position Closed";
+
+        if (pos.channel_message_id) {
+          const sent = await sendTelegramReply(env, msg, pos.channel_message_id);
+          if (sent) notifications++;
+        }
+
+        await env.DB.prepare(`
+          UPDATE signal_positions
+          SET status='CLOSED',
+              tp1_hit=?,
+              tp2_hit=?,
+              tp3_hit=?,
+              highest_price=?,
+              lowest_price=?,
+              updated_at=datetime('now')
+          WHERE id=?
+        `).bind(tp1Hit, tp2Hit, tp3Hit, highest, lowest, pos.id).run();
 
         continue;
       }
@@ -2846,9 +2885,6 @@ function isAdmin(userId, env) {
 function isAdminCommand(text) {
   const commands = [
     "/status",
-    "/positions",
-    "/pnl",
-    "/openpositions",
     "/news_on",
     "/news_off",
     "/signals_on",
@@ -2860,139 +2896,8 @@ function isAdminCommand(text) {
   return commands.indexOf(String(text || "").toLowerCase()) >= 0;
 }
 
-async function getAdminOpenPositions(env) {
-  if (!env.DB) return [];
-
-  try {
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS signal_positions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        pair TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        entry_mid REAL NOT NULL,
-        sl_price REAL NOT NULL,
-        tp1_price REAL NOT NULL,
-        tp2_price REAL NOT NULL,
-        tp3_price REAL NOT NULL,
-        tp1_hit INTEGER DEFAULT 0,
-        tp2_hit INTEGER DEFAULT 0,
-        tp3_hit INTEGER DEFAULT 0,
-        highest_price REAL,
-        lowest_price REAL,
-        status TEXT DEFAULT 'OPEN',
-        channel_message_id INTEGER,
-        created_at TEXT,
-        updated_at TEXT
-      )
-    `).run();
-
-    const result = await env.DB.prepare(`
-      SELECT * FROM signal_positions
-      WHERE status = 'OPEN'
-      ORDER BY id ASC
-      LIMIT 100
-    `).all();
-
-    return result && Array.isArray(result.results) ? result.results : [];
-  } catch (error) {
-    console.error("ADMIN POSITIONS DB ERROR", error);
-    return [];
-  }
-}
-
-async function getAdminLivePrice(symbol) {
-  try {
-    const response = await fetch(
-      "https://www.okx.com/api/v5/market/ticker?instId=" + encodeURIComponent(symbol),
-      { method: "GET", headers: { "Accept": "application/json" } }
-    );
-
-    if (!response.ok) return null;
-    const payload = await response.json();
-    const row = Array.isArray(payload.data) ? payload.data[0] : null;
-    const price = row ? Number(row.last) : NaN;
-    return price > 0 ? price : null;
-  } catch (error) {
-    return null;
-  }
-}
-
-async function buildAdminPositionsMessage(env) {
-  const positions = await getAdminOpenPositions(env);
-
-  if (!positions.length) {
-    return "📊 *OPEN SIGNAL POSITIONS*\n\nOpen: *0*";
-  }
-
-  // Fetch live prices in small batches so the admin command remains responsive
-  // and does not flood the OKX REST endpoint. This is read-only and does not
-  // alter any signal/TP/SL state.
-  const livePrices = new Map();
-  const batchSize = 5;
-  for (let i = 0; i < positions.length; i += batchSize) {
-    const batch = positions.slice(i, i + batchSize);
-    const prices = await Promise.all(batch.map(function(pos) {
-      return getAdminLivePrice(String(pos.symbol || ""));
-    }));
-    for (let j = 0; j < batch.length; j++) {
-      if (prices[j] !== null) livePrices.set(String(batch[j].symbol), prices[j]);
-    }
-  }
-
-  let totalMove = 0;
-  const lines = [
-    "📊 *OPEN SIGNAL POSITIONS*",
-    "",
-    "Open: *" + positions.length + "*",
-    ""
-  ];
-
-  positions.forEach(function(pos, index) {
-    const entry = Number(pos.entry_mid);
-    const current = livePrices.get(String(pos.symbol));
-    let pnl = null;
-
-    if (current > 0 && entry > 0) {
-      pnl = pos.direction === "SHORT"
-        ? ((entry - current) / entry) * 100
-        : ((current - entry) / entry) * 100;
-      totalMove += pnl;
-    }
-
-    const pnlText = pnl === null
-      ? "N/A"
-      : (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "%";
-
-    const hitStatus =
-      "TP1 " + (Number(pos.tp1_hit || 0) ? "✅" : "❌") + "  " +
-      "TP2 " + (Number(pos.tp2_hit || 0) ? "✅" : "❌") + "  " +
-      "TP3 " + (Number(pos.tp3_hit || 0) ? "✅" : "❌");
-
-    lines.push(
-      (index + 1) + ". *" + String(pos.pair || pos.symbol) + "* — " + String(pos.direction || "") + "\n" +
-      "Entry: `" + fmt(entry) + "`  Current: `" + (current ? fmt(current) : "N/A") + "`\n" +
-      "P/L Move: *" + pnlText + "*\n" +
-      "SL: `" + fmt(pos.sl_price) + "`  |  TP3: `" + fmt(pos.tp3_price) + "`\n" +
-      hitStatus + "\n"
-    );
-  });
-
-  lines.push("────────────────────");
-  lines.push("Total P/L Move: *" + (totalMove >= 0 ? "+" : "") + totalMove.toFixed(2) + "%*");
-  lines.push("");
-  lines.push("_This is signal price-move P/L, not broker/account P&L._");
-
-  return lines.join("\n");
-}
-
 async function handleAdminCommand(chatId, text, env) {
   const command = String(text || "").toLowerCase();
-
-  if (command === "/positions" || command === "/pnl" || command === "/openpositions") {
-    await sendTelegram(env, chatId, await buildAdminPositionsMessage(env));
-    return;
-  }
 
   if (command === "/status") {
     await sendTelegram(
@@ -3823,7 +3728,7 @@ export class OkxMonitorDO extends DurableObject {
     await this.persistPosition(pos);
 
     let effectiveStop = Number(pos.sl_price);
-    if (wasTp1Hit) effectiveStop = Number(pos.entry_mid);
+    if (Number(pos.tp1_hit || 0) === 1) effectiveStop = Number(pos.entry_mid);
 
     const tp3Hit = Number(pos.tp3_hit || 0) === 1;
     const tp3JustHit = reached.some(function(hit) { return hit.name === "TP3"; });
@@ -3837,36 +3742,52 @@ export class OkxMonitorDO extends DurableObject {
     }
 
     const stopHit = pos.direction === "LONG" ? low <= effectiveStop : high >= effectiveStop;
-    if (stopHit && (wasTp1Hit || tp3Hit) && !tp3JustHit) {
-      const closeClaim = await this.env.DB.prepare(`
-        UPDATE signal_positions
-        SET status='CLOSING', updated_at=datetime('now')
-        WHERE id=? AND status='OPEN'
-      `).bind(Number(pos.id)).run();
-      const claimedClose = Number(closeClaim && closeClaim.meta && closeClaim.meta.changes || 0) === 1;
-      if (!claimedClose) return;
 
-      pos.status = "CLOSING";
-      this.positions.delete(symbol);
-      await this.reconcileSubscriptions(false);
-
-      const entry = Number(pos.entry_mid);
+    if (stopHit && tp3Hit && !tp3JustHit) {
+      const closePrice = effectiveStop;
+      const closePct = pos.direction === "LONG"
+        ? ((closePrice - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
+        : ((Number(pos.entry_mid) - closePrice) / Number(pos.entry_mid)) * 1000;
       const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
-      const highestProfit = Math.max(0, Math.abs((peak - entry) / entry) * 1000);
+      const peakPct = pos.direction === "LONG"
+        ? ((peak - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
+        : ((Number(pos.entry_mid) - peak) / Number(pos.entry_mid)) * 1000;
       const targetStatus = ["TP1", "TP2", "TP3"]
         .filter((_, i) => Number(pos["tp" + (i + 1) + "_hit"] || 0))
         .map(x => x + " ✅").join("   ");
       const msg = "🔒 *SIGNAL CLOSED*\n\n" +
-        "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
-        "🏆 Highest Profit: *+" + highestProfit.toFixed(1) + "%*\n" +
-        "💰 Peak Price: `" + fmt(peak) + "`\n\n" +
+        "📌 " + pos.pair + " — " + pos.direction + "\n" +
+        "💰 Closed Price: `" + fmt(closePrice) + "`\n" +
+        "📊 Profit: *" + (closePct >= 0 ? "+" : "") + closePct.toFixed(1) + "%*\n\n" +
         targetStatus + "\n\n" +
-        "🔒 Position Closed at Peak\n" +
-        "📊 Closed Profit: *+" + highestProfit.toFixed(1) + "%*";
+        "🏆 Highest Favorable Price: `" + fmt(peak) + "`\n" +
+        "📈 Highest Favorable Profit: *+" + Math.max(0, peakPct).toFixed(1) + "%*";
       try {
         if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
       } finally {
-        await this.env.DB.prepare(`UPDATE signal_positions SET status='CLOSED', updated_at=datetime('now') WHERE id=? AND status='CLOSING'`).bind(Number(pos.id)).run();
+        await this.env.DB.prepare(`UPDATE signal_positions SET status='CLOSED', updated_at=datetime('now') WHERE id=? AND status='OPEN'`).bind(Number(pos.id)).run();
+        this.positions.delete(symbol);
+        await this.reconcileSubscriptions(false);
+      }
+      return;
+    }
+
+    if (stopHit && !Number(pos.tp1_hit || 0) && !Number(pos.tp2_hit || 0) && !Number(pos.tp3_hit || 0)) {
+      const closePrice = Number(pos.sl_price);
+      const lossPct = pos.direction === "LONG"
+        ? ((closePrice - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
+        : ((Number(pos.entry_mid) - closePrice) / Number(pos.entry_mid)) * 1000;
+      const msg = "😔 *SL HIT*\n\n" +
+        "📌 " + pos.pair + " — " + pos.direction + "\n" +
+        "💰 SL Price: `" + fmt(closePrice) + "`\n" +
+        "📉 Loss: *" + lossPct.toFixed(1) + "%*\n\n" +
+        "🔒 Position Closed";
+      try {
+        if (pos.channel_message_id) await sendTelegramReply(this.env, msg, pos.channel_message_id);
+      } finally {
+        await this.env.DB.prepare(`UPDATE signal_positions SET status='CLOSED', updated_at=datetime('now') WHERE id=? AND status='OPEN'`).bind(Number(pos.id)).run();
+        this.positions.delete(symbol);
+        await this.reconcileSubscriptions(false);
       }
       return;
     }
