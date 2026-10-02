@@ -2931,7 +2931,7 @@ async function handlePositionsCommand(chatId, env) {
 
     let totalMove = 0;
     let pricedCount = 0;
-    const lines = ["📊 *OPEN SIGNAL POSITIONS*", "", `Open: ${positions.length}`];
+    const lines = ["📊 OPEN SIGNAL POSITIONS", "", `Open: ${positions.length}`];
 
     positions.forEach((pos, index) => {
       const current = tickerMap.get(pos.symbol);
@@ -2949,7 +2949,7 @@ async function handlePositionsCommand(chatId, env) {
 
       lines.push(
         "",
-        `${index + 1}. *${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}*`,
+        `${index + 1}. ${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}`,
         `Entry: ${fmt(pos.entry_mid)}  Current: ${fmt(current)}`,
         `P/L Move: ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
         `SL: ${fmt(pos.sl_price)} | TP3: ${fmt(pos.tp3_price)}`,
@@ -2966,7 +2966,7 @@ async function handlePositionsCommand(chatId, env) {
       "⚠️ This is signal price-move P/L using the bot's 10X display convention, not broker/account P&L."
     );
 
-    await sendTelegram(env, chatId, lines.join("\\n"));
+    await sendTelegram(env, chatId, lines.join("\n"));
   } catch (error) {
     console.error("POSITIONS COMMAND ERROR", error);
     await sendTelegram(env, chatId, "❌ /positions error. Check Worker logs for POSITIONS COMMAND ERROR.");
