@@ -1,17 +1,29 @@
 name = "multiquant-bot"
 main = "worker.js"
 compatibility_date = "2026-09-30"
+
+keep_vars = true
+
 [observability]
 enabled = true
 head_sampling_rate = 1
+
 [vars]
 BOT_USERNAME = "multiquantacademybot"
 CHANNEL_USERNAME = "@multiquantacademy"
 CHANNEL_CHAT_ID = "@multiquantacademy"
+TEAM_ALERT_CHAT_ID = "-5218515529"
+
+GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_FALLBACK_MODEL = "gemini-3.7-flash"
+GEMINI_FALLBACK_MODEL_2 = "gemini-3.5-flash"
+GEMINI_FALLBACK_MODEL_3 = "gemini-3.1-flash-lite"
+
 SIGNAL_SCAN_INTERVAL_MINUTES = "15"
 SIGNAL_MAX_24H = "30"
-SIGNAL_MIN_GAP_MINUTES = "45"
-OKX_WS_URL = "wss://ws.okx.com:8443/ws/v5/business"
+SIGNAL_MIN_GAP_MINUTES = "25"
+
+OKX_WS_URL = "wss://ws.okx.com/ws/v5/business"
 
 [[d1_databases]]
 binding = "DB"
