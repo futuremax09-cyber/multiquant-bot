@@ -856,17 +856,9 @@ async function generateGemini(env, prompt) {
   }
 
   const primaryModel = getEnv(env, "GEMINI_MODEL", DEFAULTS.GEMINI_MODEL);
-  const fallbackModel1 = getEnv(env, "GEMINI_FALLBACK_MODEL", "gemini-3.7-flash");
-  const fallbackModel2 = getEnv(env, "GEMINI_FALLBACK_MODEL_2", "gemini-3.5-flash");
-  const fallbackModel3 = getEnv(env, "GEMINI_FALLBACK_MODEL_3", "gemini-3.1-flash-lite");
-  const models = [
-    primaryModel,
-    fallbackModel1,
-    fallbackModel2,
-    fallbackModel3
-  ].filter((model, index, list) =>
-    model && list.indexOf(model) === index
-  );
+  const fallbackModel = getEnv(env, "GEMINI_FALLBACK_MODEL", "gemini-3.7-flash");
+  const models = [primaryModel];
+  if (fallbackModel && fallbackModel !== primaryModel) models.push(fallbackModel);
 
   const requestBody = {
     system_instruction: {
@@ -2235,6 +2227,7 @@ async function monitorOpenSignals(env, tickers) {
     const positions = result && result.results ? result.results : [];
     if (!positions.length) return;
 
+    // Keep the existing shared OKX ticker snapshot as the live-price fallback.
     const tickerMap = new Map();
     if (Array.isArray(tickers)) {
       for (const ticker of tickers) {
@@ -2244,25 +2237,21 @@ async function monitorOpenSignals(env, tickers) {
       }
     }
 
-    const LEVERAGE_MULTIPLIER = 10;
     let notifications = 0;
 
     for (const pos of positions) {
       const livePrice = tickerMap.get(pos.symbol);
       if (!(livePrice > 0)) continue;
 
-      const entry = Number(pos.entry_mid);
-      const originalStop = Number(pos.sl_price);
-      if (!(entry > 0) || !(originalStop > 0)) continue;
-
-      let highest = Number(pos.highest_price || entry);
-      let lowest = Number(pos.lowest_price || entry);
+      let highest = Number(pos.highest_price || pos.entry_mid);
+      let lowest = Number(pos.lowest_price || pos.entry_mid);
       let tp1Hit = Number(pos.tp1_hit || 0);
       let tp2Hit = Number(pos.tp2_hit || 0);
       let tp3Hit = Number(pos.tp3_hit || 0);
 
-      // Latest live price is the fallback. The 5m candle range is also used
-      // so a target/stop hit between cron executions is not missed.
+      // IMPORTANT: read the latest 5-minute candle for this live position.
+      // The candle HIGH/LOW catches targets even when price hits a target and
+      // returns before the next cron execution.
       let candleHigh = livePrice;
       let candleLow = livePrice;
 
@@ -2306,14 +2295,20 @@ async function monitorOpenSignals(env, tickers) {
         highest = Math.max(highest, candleHigh);
       }
 
+      const favorablePrice = pos.direction === "LONG" ? highest : lowest;
+      const favorablePct = pos.direction === "LONG"
+        ? ((highest - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
+        : ((Number(pos.entry_mid) - lowest) / Number(pos.entry_mid)) * 1000;
+
+      // Detect every target independently from the candle range.
+      const reached = [];
       const targetHit = function(targetPrice, direction) {
-        if (direction === "LONG") return candleHigh >= Number(targetPrice);
+        if (direction === "LONG") {
+          return candleHigh >= Number(targetPrice);
+        }
         return candleLow <= Number(targetPrice);
       };
 
-      // Targets are milestones, not exits. Each target is replied to the
-      // original signal message and is recorded only once.
-      const reached = [];
       if (!tp1Hit && targetHit(pos.tp1_price, pos.direction)) {
         tp1Hit = 1;
         reached.push("TP1");
@@ -2327,6 +2322,7 @@ async function monitorOpenSignals(env, tickers) {
         reached.push("TP3");
       }
 
+      // Send a separate reply for every target reached.
       for (const target of reached) {
         const targetPrice = target === "TP1"
           ? Number(pos.tp1_price)
@@ -2335,7 +2331,7 @@ async function monitorOpenSignals(env, tickers) {
             : Number(pos.tp3_price);
 
         const targetPct = Math.abs(
-          ((targetPrice - entry) / entry) * LEVERAGE_MULTIPLIER * 100
+          ((targetPrice - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000
         ).toFixed(1);
 
         const msg =
@@ -2352,7 +2348,79 @@ async function monitorOpenSignals(env, tickers) {
         }
       }
 
-      // Persist milestones/extremes before exit evaluation.
+      /*
+       * EXIT LOGIC
+       * --------------------------------------------------------
+       * TP1/TP2/TP3 are milestones, NOT exits.
+       * After TP1, entry is the protective floor/ceiling.
+       * After TP3, the trade continues running while favorable.
+       * Once TP3 is hit, a 20% retracement of the maximum favorable
+       * move is used as the trailing reversal point. This prevents
+       * an unnecessary close immediately after TP3 while still
+       * closing after a meaningful reversal.
+       */
+      let effectiveStop = Number(pos.sl_price);
+
+      if (tp1Hit) {
+        effectiveStop = Number(pos.entry_mid);
+      }
+
+      if (tp3Hit) {
+        const entry = Number(pos.entry_mid);
+
+        if (pos.direction === "LONG" && highest > entry) {
+          const favorableMove = highest - entry;
+          effectiveStop = entry + (favorableMove * 0.80);
+        } else if (pos.direction === "SHORT" && lowest < entry) {
+          const favorableMove = entry - lowest;
+          effectiveStop = entry - (favorableMove * 0.80);
+        }
+      }
+
+      // For a 5m candle, use its range for stop/reversal detection too.
+      // This prevents missing a reversal that happened inside the interval.
+      const stopHit = pos.direction === "LONG"
+        ? candleLow <= effectiveStop
+        : candleHigh >= effectiveStop;
+
+      if (stopHit && tp1Hit) {
+        const closePct = Math.max(0, Number(favorablePct)).toFixed(1);
+
+        const msg =
+          "🔒 *SIGNAL CLOSED*\n\n" +
+          "📌 " + pos.pair + " — " + pos.direction + "\n" +
+          "🏆 Highest Profit: *+" + closePct + "%*\n\n" +
+          "TP1 " + (tp1Hit ? "✅" : "❌") +
+          "   TP2 " + (tp2Hit ? "✅" : "❌") +
+          "   TP3 " + (tp3Hit ? "✅" : "❌");
+
+        if (pos.channel_message_id) {
+          const sent = await sendTelegramReply(env, msg, pos.channel_message_id);
+          if (sent) notifications++;
+        }
+
+        await env.DB.prepare(`
+          UPDATE signal_positions
+          SET status='CLOSED',
+              tp1_hit=?,
+              tp2_hit=?,
+              tp3_hit=?,
+              highest_price=?,
+              lowest_price=?,
+              updated_at=datetime('now')
+          WHERE id=?
+        `).bind(
+          tp1Hit,
+          tp2Hit,
+          tp3Hit,
+          highest,
+          lowest,
+          pos.id
+        ).run();
+
+        continue;
+      }
+
       await env.DB.prepare(`
         UPDATE signal_positions
         SET tp1_hit=?,
@@ -2370,121 +2438,6 @@ async function monitorOpenSignals(env, tickers) {
         lowest,
         pos.id
       ).run();
-
-      /*
-       * EXIT LOGIC
-       *
-       * 1) Before TP1: original SL is active. A direct SL is a loss and
-       *    closes immediately.
-       *
-       * 2) After TP1: SL is protected at entry. If price later comes back
-       *    to entry, close at entry (no "break-even" wording).
-       *
-       * 3) After TP3: TP3 does NOT close the trade. The highest favorable
-       *    price for LONG / lowest favorable price for SHORT is tracked and
-       *    an 80% favorable-move trailing stop is recalculated every check.
-       *
-       * 4) The same candle that first hits TP3 is never allowed to close the
-       *    position from the newly-created trailing stop. This prevents an
-       *    immediate false close on the TP3 candle.
-       */
-      let effectiveStop = originalStop;
-      if (tp1Hit) effectiveStop = entry;
-
-      const tp3JustHit = reached.includes("TP3");
-      if (tp3Hit) {
-        if (pos.direction === "LONG" && highest > entry) {
-          effectiveStop = entry + (highest - entry) * 0.80;
-        } else if (pos.direction === "SHORT" && lowest < entry) {
-          effectiveStop = entry - (entry - lowest) * 0.80;
-        }
-      }
-
-      const stopHit = pos.direction === "LONG"
-        ? candleLow <= effectiveStop
-        : candleHigh >= effectiveStop;
-
-      // Do not close on the same scan that newly detected TP3.
-      if (stopHit && !tp3JustHit) {
-        const closePrice = effectiveStop;
-        const closedPriceMovePct = pos.direction === "LONG"
-          ? ((closePrice - entry) / entry) * 100
-          : ((entry - closePrice) / entry) * 100;
-        const closedProfitPct = closedPriceMovePct * LEVERAGE_MULTIPLIER;
-
-        const targetStatus =
-          "TP1 " + (tp1Hit ? "✅" : "❌") +
-          "   TP2 " + (tp2Hit ? "✅" : "❌") +
-          "   TP3 " + (tp3Hit ? "✅" : "❌");
-
-        const closeEventKey = "CLOSE:" + pos.id;
-        const closeClaimed = await claimSignalEvent(env, closeEventKey);
-        if (!closeClaimed) {
-          console.log("CLOSE DUPLICATE BLOCK", closeEventKey);
-          continue;
-        }
-
-        let msg;
-        if (!tp1Hit && !tp2Hit && !tp3Hit) {
-          // Direct original-SL loss: no favorable target was reached.
-          msg =
-            "😔 *SL HIT*\n\n" +
-            "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
-            "💰 SL Price: `" + fmt(originalStop) + "`\n" +
-            "📉 Loss: *" + (closedProfitPct > 0 ? "+" : "") + closedProfitPct.toFixed(1) + "%*\n\n" +
-            "🔒 Position Closed";
-        } else {
-          // Protected/trailing close: show the REAL close price and REAL
-          // realized price-move P/L, not the peak/highest profit as the exit.
-          const peak = pos.direction === "LONG" ? highest : lowest;
-          const peakProfitPct = pos.direction === "LONG"
-            ? ((peak - entry) / entry) * LEVERAGE_MULTIPLIER * 100
-            : ((entry - peak) / entry) * LEVERAGE_MULTIPLIER * 100;
-
-          msg =
-            "🔒 *SIGNAL CLOSED*\n\n" +
-            "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
-            "💰 Closed Price: `" + fmt(closePrice) + "`\n" +
-            "📊 Profit: *" + (closedProfitPct > 0 ? "+" : "") + closedProfitPct.toFixed(1) + "%*\n" +
-            "🏆 Highest Profit: *+" + Math.max(0, peakProfitPct).toFixed(1) + "%*\n\n" +
-            targetStatus + "\n\n" +
-            "🔒 Position Closed";
-        }
-
-        const sent = pos.channel_message_id
-          ? await sendTelegramReply(env, msg, pos.channel_message_id)
-          : true;
-
-        if (!sent) {
-          await releaseSignalEvent(env, closeEventKey);
-          continue;
-        }
-
-        await env.DB.prepare(`
-          UPDATE signal_positions
-          SET status='CLOSED',
-              tp1_hit=?,
-              tp2_hit=?,
-              tp3_hit=?,
-              highest_price=?,
-              lowest_price=?,
-              updated_at=datetime('now')
-          WHERE id=? AND status='OPEN'
-        `).bind(
-          tp1Hit,
-          tp2Hit,
-          tp3Hit,
-          highest,
-          lowest,
-          pos.id
-        ).run();
-
-        continue;
-      }
-    }
-
-    if (notifications) {
-      console.log("SIGNAL MONITOR NOTIFICATIONS", notifications);
     }
   } catch (error) {
     console.error("SIGNAL MONITOR ERROR", error);
@@ -2893,6 +2846,9 @@ function isAdmin(userId, env) {
 function isAdminCommand(text) {
   const commands = [
     "/status",
+    "/positions",
+    "/pnl",
+    "/openpositions",
     "/news_on",
     "/news_off",
     "/signals_on",
@@ -2904,8 +2860,139 @@ function isAdminCommand(text) {
   return commands.indexOf(String(text || "").toLowerCase()) >= 0;
 }
 
+async function getAdminOpenPositions(env) {
+  if (!env.DB) return [];
+
+  try {
+    await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS signal_positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        pair TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        entry_mid REAL NOT NULL,
+        sl_price REAL NOT NULL,
+        tp1_price REAL NOT NULL,
+        tp2_price REAL NOT NULL,
+        tp3_price REAL NOT NULL,
+        tp1_hit INTEGER DEFAULT 0,
+        tp2_hit INTEGER DEFAULT 0,
+        tp3_hit INTEGER DEFAULT 0,
+        highest_price REAL,
+        lowest_price REAL,
+        status TEXT DEFAULT 'OPEN',
+        channel_message_id INTEGER,
+        created_at TEXT,
+        updated_at TEXT
+      )
+    `).run();
+
+    const result = await env.DB.prepare(`
+      SELECT * FROM signal_positions
+      WHERE status = 'OPEN'
+      ORDER BY id ASC
+      LIMIT 100
+    `).all();
+
+    return result && Array.isArray(result.results) ? result.results : [];
+  } catch (error) {
+    console.error("ADMIN POSITIONS DB ERROR", error);
+    return [];
+  }
+}
+
+async function getAdminLivePrice(symbol) {
+  try {
+    const response = await fetch(
+      "https://www.okx.com/api/v5/market/ticker?instId=" + encodeURIComponent(symbol),
+      { method: "GET", headers: { "Accept": "application/json" } }
+    );
+
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const row = Array.isArray(payload.data) ? payload.data[0] : null;
+    const price = row ? Number(row.last) : NaN;
+    return price > 0 ? price : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function buildAdminPositionsMessage(env) {
+  const positions = await getAdminOpenPositions(env);
+
+  if (!positions.length) {
+    return "📊 *OPEN SIGNAL POSITIONS*\n\nOpen: *0*";
+  }
+
+  // Fetch live prices in small batches so the admin command remains responsive
+  // and does not flood the OKX REST endpoint. This is read-only and does not
+  // alter any signal/TP/SL state.
+  const livePrices = new Map();
+  const batchSize = 5;
+  for (let i = 0; i < positions.length; i += batchSize) {
+    const batch = positions.slice(i, i + batchSize);
+    const prices = await Promise.all(batch.map(function(pos) {
+      return getAdminLivePrice(String(pos.symbol || ""));
+    }));
+    for (let j = 0; j < batch.length; j++) {
+      if (prices[j] !== null) livePrices.set(String(batch[j].symbol), prices[j]);
+    }
+  }
+
+  let totalMove = 0;
+  const lines = [
+    "📊 *OPEN SIGNAL POSITIONS*",
+    "",
+    "Open: *" + positions.length + "*",
+    ""
+  ];
+
+  positions.forEach(function(pos, index) {
+    const entry = Number(pos.entry_mid);
+    const current = livePrices.get(String(pos.symbol));
+    let pnl = null;
+
+    if (current > 0 && entry > 0) {
+      pnl = pos.direction === "SHORT"
+        ? ((entry - current) / entry) * 100
+        : ((current - entry) / entry) * 100;
+      totalMove += pnl;
+    }
+
+    const pnlText = pnl === null
+      ? "N/A"
+      : (pnl >= 0 ? "+" : "") + pnl.toFixed(2) + "%";
+
+    const hitStatus =
+      "TP1 " + (Number(pos.tp1_hit || 0) ? "✅" : "❌") + "  " +
+      "TP2 " + (Number(pos.tp2_hit || 0) ? "✅" : "❌") + "  " +
+      "TP3 " + (Number(pos.tp3_hit || 0) ? "✅" : "❌");
+
+    lines.push(
+      (index + 1) + ". *" + String(pos.pair || pos.symbol) + "* — " + String(pos.direction || "") + "\n" +
+      "Entry: `" + fmt(entry) + "`  Current: `" + (current ? fmt(current) : "N/A") + "`\n" +
+      "P/L Move: *" + pnlText + "*\n" +
+      "SL: `" + fmt(pos.sl_price) + "`  |  TP3: `" + fmt(pos.tp3_price) + "`\n" +
+      hitStatus + "\n"
+    );
+  });
+
+  lines.push("────────────────────");
+  lines.push("Total P/L Move: *" + (totalMove >= 0 ? "+" : "") + totalMove.toFixed(2) + "%*");
+  lines.push("");
+  lines.push("_This is signal price-move P/L, not broker/account P&L._");
+
+  return lines.join("\n");
+}
+
 async function handleAdminCommand(chatId, text, env) {
   const command = String(text || "").toLowerCase();
+
+  if (command === "/positions" || command === "/pnl" || command === "/openpositions") {
+    await sendTelegram(env, chatId, await buildAdminPositionsMessage(env));
+    return;
+  }
 
   if (command === "/status") {
     await sendTelegram(
