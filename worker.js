@@ -856,9 +856,17 @@ async function generateGemini(env, prompt) {
   }
 
   const primaryModel = getEnv(env, "GEMINI_MODEL", DEFAULTS.GEMINI_MODEL);
-  const fallbackModel = getEnv(env, "GEMINI_FALLBACK_MODEL", "gemini-3.7-flash");
-  const models = [primaryModel];
-  if (fallbackModel && fallbackModel !== primaryModel) models.push(fallbackModel);
+  const fallbackModel1 = getEnv(env, "GEMINI_FALLBACK_MODEL", "gemini-3.7-flash");
+  const fallbackModel2 = getEnv(env, "GEMINI_FALLBACK_MODEL_2", "gemini-3.5-flash");
+  const fallbackModel3 = getEnv(env, "GEMINI_FALLBACK_MODEL_3", "gemini-3.1-flash-lite");
+  const models = [
+    primaryModel,
+    fallbackModel1,
+    fallbackModel2,
+    fallbackModel3
+  ].filter((model, index, list) =>
+    model && list.indexOf(model) === index
+  );
 
   const requestBody = {
     system_instruction: {
