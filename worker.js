@@ -112,6 +112,11 @@ const DEFAULTS = {
   SIGNAL_MAX_24H: 30,
   SIGNAL_MIN_GAP_MINUTES: 45,
   SIGNAL_SCAN_INTERVAL_MINUTES: 15,
+  RAPID_MOVE_THRESHOLD_PCT: 10,
+  RAPID_MOVE_WINDOW_MINUTES: 10,
+  RAPID_MOVE_MAX_POSTS_PER_RUN: 3,
+  MARKET_LIST_TOP_N: 10,
+  MARKET_LIST_HOUR_UTC: 0,
 
   // Follow-up schedule: days after last meaningful interaction.
   FOLLOWUP_DAYS: [1, 2, 3, 5, 7],
@@ -510,7 +515,7 @@ async function handleChatMember(update, env) {
   await sendTelegram(env, String(chat.id), welcome, keyboard);
 
   // Optional internal team/admin notice. This is NOT a public member profile.
-  const alertChat = env.ADMIN_CHAT_ID || env.TEAM_ALERT_CHAT_ID || "";
+  const alertChat = env.TEAM_ALERT_CHAT_ID || "";
   if (alertChat) {
     await sendTelegram(
       env,
@@ -2033,7 +2038,7 @@ async function runSignalJob(env, tickers) {
     });
 
     const setups = [];
-    const maxCandidates = Math.min(usdt.length, 20);
+    const maxCandidates = Math.min(usdt.length, 50);
 
     for (let i = 0; i < maxCandidates; i++) {
       const setup = await buildOkxSetup(usdt[i]);
@@ -2307,354 +2312,8 @@ async function createSignalPosition(env, setup, messageId) {
 
 async function monitorOpenSignals(env, tickers) {
   // Legacy D1/ticker monitor intentionally disabled. OkxMonitorDO is the single
-  // authoritative TP/SL monitor; keeping a second engine risks duplicate alerts.
+  // authoritative TP/SL monitor to avoid duplicate notifications.
   return;
-  /*
-  if (!env.DB || !isEnabled(env, "SIGNALS_ENABLED", true)) return;
-  try {
-    await ensureSchema(env);
-    const result = await env.DB.prepare("SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 50").all();
-    const positions = result?.results || [];
-    if (!positions.length) return;
-    const tickerMap = new Map((tickers || []).filter(x => x?.instId && Number(x.last) > 0).map(x => [x.instId, Number(x.last)]));
-
-    for (const pos of positions) {
-      const livePrice = tickerMap.get(pos.symbol);
-      if (!(livePrice > 0)) continue;
-      let highest = Number(pos.highest_price || pos.entry_mid);
-      let lowest = Number(pos.lowest_price || pos.entry_mid);
-      let tp1Hit = Number(pos.tp1_hit || 0), tp2Hit = Number(pos.tp2_hit || 0), tp3Hit = Number(pos.tp3_hit || 0);
-      let candleHigh = livePrice, candleLow = livePrice;
-      try {
-        const r = await fetch("https://www.okx.com/api/v5/market/candles?instId=" + encodeURIComponent(pos.symbol) + "&bar=5m&limit=1");
-        if (r.ok) {
-          const d = await r.json(), c = Array.isArray(d.data) ? d.data[0] : null;
-          if (Array.isArray(c) && c.length >= 5) {
-            const h = Number(c[2]), l = Number(c[3]);
-            if (h > 0 && l > 0) { candleHigh = Math.max(livePrice, h); candleLow = Math.min(livePrice, l); }
-          }
-        }
-      } catch (e) { console.error("OKX POSITION CANDLE FETCH ERROR", pos.symbol, e); }
-
-      highest = Math.max(highest, candleHigh, livePrice);
-      lowest = Math.min(lowest, candleLow, livePrice);
-
-      // Reconcile target state from the persistent favorable extreme. This is
-      // the important recovery path after cron gaps, restart, or missed replies.
-      const newlyReached = [];
-      const checks = [
-        ["TP1", "tp1_hit", Number(pos.tp1_price)],
-        ["TP2", "tp2_hit", Number(pos.tp2_price)],
-        ["TP3", "tp3_hit", Number(pos.tp3_price)]
-      ];
-      for (const [name, field, target] of checks) {
-        if (Number(pos[field] || 0)) continue;
-        const hit = pos.direction === "LONG" ? highest >= target : lowest <= target;
-        if (!hit) continue;
-        const claim = await env.DB.prepare(`UPDATE signal_positions SET ${field}=1, highest_price=?, lowest_price=?, updated_at=datetime('now') WHERE id=? AND status='OPEN' AND ${field}=0`).bind(highest, lowest, pos.id).run();
-        if (Number(claim?.meta?.changes || 0) === 1) {
-          pos[field] = 1;
-          if (field === "tp1_hit") tp1Hit = 1;
-          if (field === "tp2_hit") tp2Hit = 1;
-          if (field === "tp3_hit") tp3Hit = 1;
-          newlyReached.push({name, price: target});
-        }
-      }
-
-      for (const hit of newlyReached) {
-        const pct = Math.abs((Number(hit.price) - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000;
-        const msg = "🎯 *" + hit.name + " HIT*\n\n📌 " + pos.pair + " — " + pos.direction + "\n💰 Price: `" + reportFmt(hit.price) + "`\n📈 Profit: *+" + pct.toFixed(1) + "%*" + (hit.name === "TP1" ? "\n\n⚠️ SL is now protected at entry." : "");
-        if (pos.channel_message_id) await sendTelegramReply(env, msg, pos.channel_message_id);
-      }
-
-      await env.DB.prepare("UPDATE signal_positions SET tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=?,updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(tp1Hit, tp2Hit, tp3Hit, highest, lowest, pos.id).run();
-
-      const anyTp = tp1Hit || tp2Hit || tp3Hit;
-      let effectiveStop = Number(pos.sl_price);
-      if (tp1Hit) effectiveStop = Number(pos.entry_mid);
-      if (tp3Hit) {
-        const entry = Number(pos.entry_mid);
-        effectiveStop = pos.direction === "LONG"
-          ? entry + (Math.max(0, highest - entry) * 0.80)
-          : entry - (Math.max(0, entry - lowest) * 0.80);
-      }
-      const stopHit = pos.direction === "LONG" ? candleLow <= effectiveStop : candleHigh >= effectiveStop;
-      if (!stopHit) continue;
-
-      // A candle can prove that a stop was touched, but cannot prove whether
-      // the stop or a target happened first. If TP3 was newly touched in this
-      // same candle, wait for the next update rather than inventing the order.
-      const tp3JustHit = newlyReached.some(x => x.name === "TP3");
-      if (tp3JustHit) continue;
-
-      const closePrice = effectiveStop;
-      const realizedAtClose = reportMovePct(pos.direction, pos.entry_mid, closePrice);
-      const peak = pos.direction === "LONG" ? highest : lowest;
-      const peakPct = Math.max(0, reportMovePct(pos.direction, pos.entry_mid, peak) || 0);
-      // Once any TP has been reached, the reported trade profit is the best
-      // favorable move achieved by the position. Direct SL remains the actual
-      // negative move at the SL price.
-      const reportProfit = anyTp ? peakPct : realizedAtClose;
-      const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
-      const closeClaim = await env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(pos.id).run();
-      if (Number(closeClaim?.meta?.changes || 0) !== 1) continue;
-
-      const msg = anyTp
-        ? "🔒 *SIGNAL CLOSED*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 Closed Price: `" + reportFmt(closePrice) + "`\n📊 Profit: *+" + peakPct.toFixed(1) + "%*\n\n🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n🏆 Highest Profit: *+" + peakPct.toFixed(1) + "%*\n\n🎯 Targets Hit: *" + formatHitTargets(pos) + "*\n\n🔒 Position Closed
-        : "😔 *SL HIT*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 SL Price: `" + reportFmt(closePrice) + "`\n📉 Loss: *" + (realizedAtClose >= 0 ? "+" : "") + realizedAtClose.toFixed(1) + "%*\n\n🔒 Position Closed";
-      try {
-        if (pos.channel_message_id) await sendTelegramReply(env, msg, pos.channel_message_id);
-      } finally {
-        await env.DB.prepare("UPDATE signal_positions SET status='CLOSED',tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=?,closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(tp1Hit,tp2Hit,tp3Hit,highest,lowest,closePrice,reportProfit,peakPct,reason,pos.id).run();
-      }
-    }
-  } catch (error) { console.error("SIGNAL MONITOR ERROR", error); }
-}
-
-async function sendTelegramReply(env, text, replyToMessageId) {
-  const channel = getEnv(env, "CHANNEL_CHAT_ID", DEFAULTS.CHANNEL_CHAT_ID);
-  if (!channel || !env.TELEGRAM_BOT_TOKEN || !replyToMessageId) return false;
-
-  const body = {
-    chat_id: channel,
-    text: text,
-    parse_mode: "Markdown",
-    disable_web_page_preview: true,
-    reply_to_message_id: Number(replyToMessageId),
-    allow_sending_without_reply: true
-  };
-
-  try {
-    const response = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/sendMessage", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-    if (!response.ok) {
-      console.error("TELEGRAM REPLY ERROR", await response.text());
-      return false;
-    }
-    return true;
-  } catch (error) {
-    console.error("TELEGRAM REPLY FETCH ERROR", error);
-    return false;
-  }
-}
-
-function pct24h(ticker) {
-  const last = Number(ticker && ticker.last);
-  const open = Number(ticker && ticker.open24h);
-  if (!(last > 0) || !(open > 0)) return NaN;
-  return ((last - open) / open) * 100;
-}
-
-async function buildOkxSetup(ticker) {
-  try {
-    const symbol = ticker.instId;
-    const url =
-      "https://www.okx.com/api/v5/market/candles?instId=" +
-      encodeURIComponent(symbol) + "&bar=15m&limit=60";
-
-    const response = await fetch(url);
-    if (!response.ok) return null;
-
-    const payload = await response.json();
-    const candles = Array.isArray(payload.data) ? payload.data.slice().reverse() : [];
-    if (candles.length < 30) return null;
-
-    const closes = candles.map(function(c) { return Number(c[4]); });
-    const highs = candles.map(function(c) { return Number(c[2]); });
-    const lows = candles.map(function(c) { return Number(c[3]); });
-    const volumes = candles.map(function(c) { return Number(c[5]); });
-
-    const ema9 = ema(closes, 9);
-    const ema21 = ema(closes, 21);
-    const rsiValue = rsi(closes, 14);
-    const price = closes[closes.length - 1];
-    if (!Number.isFinite(price) || !Number.isFinite(rsiValue)) return null;
-
-    const trendUp = ema9 > ema21;
-    const trendDown = ema9 < ema21;
-    const recentHigh = Math.max.apply(null, highs.slice(-12));
-    const recentLow = Math.min.apply(null, lows.slice(-12));
-    const avgVol = volumes.slice(-21, -1).reduce(function(a, b) { return a + b; }, 0) / 20;
-    const currentVol = volumes[volumes.length - 1];
-    const volumeRatio = avgVol > 0 ? currentVol / avgVol : 1;
-
-    let direction = "";
-    let score = 0;
-
-    if (trendUp && rsiValue >= 48 && rsiValue <= 70) {
-      direction = "LONG";
-      score += 40;
-      if (rsiValue >= 52 && rsiValue <= 65) score += 15;
-    } else if (trendDown && rsiValue >= 30 && rsiValue <= 52) {
-      direction = "SHORT";
-      score += 40;
-      if (rsiValue >= 35 && rsiValue <= 48) score += 15;
-    } else {
-      return null;
-    }
-
-    if (volumeRatio >= 1.2) score += 20;
-    if (volumeRatio >= 1.5) score += 10;
-
-    const change24h = pct24h(ticker);
-    if (Number.isFinite(change24h)) {
-      if ((direction === "LONG" && change24h > 0) ||
-          (direction === "SHORT" && change24h < 0)) score += 10;
-    }
-
-    // Entry is a practical area around the current market price.
-    const entryLow = price * 0.999;
-    const entryHigh = price * 1.001;
-    const entryMid = (entryLow + entryHigh) / 2;
-
-    // Structural SL is retained from the existing scanner logic.
-    let sl;
-    if (direction === "LONG") {
-      sl = recentLow < price ? recentLow : price * 0.995;
-      if (!(sl > 0 && sl < entryMid)) return null;
-    } else {
-      sl = recentHigh > price ? recentHigh : price * 1.005;
-      if (!(sl > entryMid)) return null;
-    }
-
-    // 10X leverage: targets are opportunity-based, not fixed.
-    // Allowed displayed P&L bands:
-    // TP1 = 15–20%, TP2 = 30–35%, TP3 = 60–65%.
-    // Stronger setups/volatility move toward the upper end of each band.
-    const scoreOpportunity = Math.max(0, Math.min(1, (score - 40) / 55));
-    const volatilityOpportunity = Number.isFinite(change24h)
-      ? Math.max(0, Math.min(1, Math.abs(change24h) / 10))
-      : 0;
-    const opportunity = (scoreOpportunity * 0.70) + (volatilityOpportunity * 0.30);
-
-    const targetPcts = [
-      Number((15 + (5 * opportunity)).toFixed(1)),
-      Number((30 + (5 * opportunity)).toFixed(1)),
-      Number((60 + (5 * opportunity)).toFixed(1))
-    ];
-    const targetMoves = targetPcts.map(function(p) { return p / 10 / 100; });
-
-    let tp1, tp2, tp3;
-    if (direction === "LONG") {
-      tp1 = entryMid * (1 + targetMoves[0]);
-      tp2 = entryMid * (1 + targetMoves[1]);
-      tp3 = entryMid * (1 + targetMoves[2]);
-    } else {
-      tp1 = entryMid * (1 - targetMoves[0]);
-      tp2 = entryMid * (1 - targetMoves[1]);
-      tp3 = entryMid * (1 - targetMoves[2]);
-    }
-
-    const tradeSetup = detectTradeSetup(closes, highs, lows, direction);
-    const rawCoin = symbol.replace("-USDT-SWAP", "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
-
-    return {
-      symbol: symbol,
-      pair: rawCoin + "/USDT",
-      coinTag: rawCoin + "USDT",
-      direction: direction,
-      entry: fmt(entryLow) + " – " + fmt(entryHigh),
-      entryLow: entryLow,
-      entryHigh: entryHigh,
-      entryMid: entryMid,
-      sl: fmt(sl),
-      slPrice: sl,
-      tp1: fmt(tp1),
-      tp2: fmt(tp2),
-      tp3: fmt(tp3),
-      tp1Price: tp1,
-      tp2Price: tp2,
-      tp3Price: tp3,
-      tp1Pct: targetPcts[0],
-      tp2Pct: targetPcts[1],
-      tp3Pct: targetPcts[2],
-      rsi: fmt(rsiValue),
-      emaTrend: direction === "LONG" ? "Bullish" : "Bearish",
-      change24h: Number.isFinite(change24h) ? fmt(change24h) : "n/a",
-      volume: fmt(volumeRatio) + "x avg",
-      tradeSetup: tradeSetup,
-      timeframe: "15M",
-      score: score
-    };
-  } catch (error) {
-    return null;
-  }
-}
-
-function detectTradeSetup(closes, highs, lows, direction) {
-  const n = closes.length;
-  const last = closes[n - 1];
-  const prev = closes[n - 2];
-  const high20 = Math.max.apply(null, highs.slice(-20, -1));
-  const low20 = Math.min.apply(null, lows.slice(-20, -1));
-  const range = Math.max.apply(null, highs.slice(-8)) - Math.min.apply(null, lows.slice(-8));
-  const recent = closes.slice(-6);
-  const rising = recent[recent.length - 1] > recent[0];
-  const falling = recent[recent.length - 1] < recent[0];
-
-  if (direction === "LONG" && last > high20 && prev <= high20) return "Bullish Breakout";
-  if (direction === "SHORT" && last < low20 && prev >= low20) return "Bearish Breakdown";
-
-  const lows6 = lows.slice(-12);
-  const highs6 = highs.slice(-12);
-  const firstLow = Math.min.apply(null, lows6.slice(0, 6));
-  const secondLow = Math.min.apply(null, lows6.slice(6));
-  const firstHigh = Math.max.apply(null, highs6.slice(0, 6));
-  const secondHigh = Math.max.apply(null, highs6.slice(6));
-
-  if (direction === "LONG" && Math.abs(firstLow - secondLow) / Math.max(firstLow, 1) < 0.008) return "Double Bottom";
-  if (direction === "SHORT" && Math.abs(firstHigh - secondHigh) / Math.max(firstHigh, 1) < 0.008) return "Double Top";
-  if (direction === "LONG" && rising && range > 0) return "Bullish Flag";
-  if (direction === "SHORT" && falling && range > 0) return "Bearish Flag";
-  if (direction === "LONG") return "Support Bounce";
-  return "Resistance Rejection";
-}
-
-function ema(values, period) {
-  if (!values.length) return NaN;
-
-  const multiplier = 2 / (period + 1);
-  let value = values[0];
-
-  for (let i = 1; i < values.length; i++) {
-    value = ((values[i] - value) * multiplier) + value;
-  }
-
-  return value;
-}
-
-function rsi(values, period) {
-  if (values.length <= period) return NaN;
-
-  let gains = 0;
-  let losses = 0;
-
-  for (let i = 1; i <= period; i++) {
-    const delta = values[i] - values[i - 1];
-
-    if (delta >= 0) gains += delta;
-    else losses += Math.abs(delta);
-  }
-
-  let avgGain = gains / period;
-  let avgLoss = losses / period;
-
-  for (let i = period + 1; i < values.length; i++) {
-    const delta = values[i] - values[i - 1];
-    const gain = delta > 0 ? delta : 0;
-    const loss = delta < 0 ? Math.abs(delta) : 0;
-
-    avgGain = ((avgGain * (period - 1)) + gain) / period;
-    avgLoss = ((avgLoss * (period - 1)) + loss) / period;
-  }
-
-  if (avgLoss === 0) return 100;
-
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
 }
 
 /* ============================================================
@@ -2901,12 +2560,26 @@ async function handlePositionsCommand(chatId, env) {
       ORDER BY id ASC
       LIMIT 50
     `).all();
-    const positions = result?.results || [];
+    let positions = result?.results || [];
+    try {
+      if (env.OKX_MONITOR) {
+        const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
+        const stub = env.OKX_MONITOR.get(id);
+        const response = await stub.fetch("https://okx-monitor/closed");
+        if (response.ok) {
+          const data = await response.json();
+          const closed = new Set((data?.ids || []).map(String));
+          positions = positions.filter(p => !closed.has(String(p.id)));
+        }
+      }
+    } catch (error) {
+      console.error("POSITIONS CLOSED-STATE FILTER ERROR", error);
+    }
 
     if (!positions.length) {
       return await sendTelegram(env, chatId,
         "📊 *LIVE OPEN SIGNAL POSITIONS*\n\n" +
-        "━━━━━━━━━━━━━━━━━━\n\n" +
+        "━━━━━━━━━━━━━━━━━━\n" +
         "No open positions."
       );
     }
@@ -2932,12 +2605,11 @@ async function handlePositionsCommand(chatId, env) {
       const peakMove = reportMovePct(pos.direction, pos.entry_mid, peak);
       const hitTargets = formatHitTargets(pos);
 
-      const blockLines = [
+      const block = [
         `*${i + 1}. ${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}*`,
         "",
         `📅 Opened: ${opened.date}`,
         `⏰ Time: ${opened.time}`,
-        "",
         `💰 Entry: ${reportFmt(pos.entry_mid)}`,
         `📍 Current: ${reportFmt(current)}`,
         `📊 Current P/L (10X): ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
@@ -2946,21 +2618,20 @@ async function handlePositionsCommand(chatId, env) {
         `🎯 TP2: ${reportFmt(pos.tp2_price)}`,
         `🎯 TP3: ${reportFmt(pos.tp3_price)}`,
         `🛑 SL: ${reportFmt(pos.sl_price)}`,
-        "",
-        ...(hitTargets ? [`🎯 Hit: ${hitTargets}`, ""] : []),
+        ...(hitTargets ? [`✅ Targets Hit: ${hitTargets}`] : []),
         `🏆 Best Move (10X): ${peakMove === null ? "N/A" : (peakMove >= 0 ? "+" : "") + peakMove.toFixed(2) + "%"}`
-      ];
+      ].join("\n");
 
-      return { index: i + 1, move, block: blockLines.join("\n") };
+      return { index: i + 1, move, block };
     });
 
     const validMoves = rows.filter(x => x.move !== null);
     const profitable = validMoves.filter(x => x.move > 0).length;
     const losing = validMoves.filter(x => x.move < 0).length;
     const flat = validMoves.filter(x => x.move === 0).length;
-    const currentProfit = validMoves.reduce((sum, x) => sum + Math.max(0, x.move), 0);
-    const currentLoss = validMoves.reduce((sum, x) => sum + Math.min(0, x.move), 0);
-    const currentNet = currentProfit + currentLoss;
+    const currentProfit = validMoves.filter(x => x.move > 0).reduce((sum, x) => sum + x.move, 0);
+    const currentLoss = validMoves.filter(x => x.move < 0).reduce((sum, x) => sum + Math.abs(x.move), 0);
+    const currentNet = currentProfit - currentLoss;
     const best = validMoves.slice().sort((a, b) => b.move - a.move)[0];
     const worst = validMoves.slice().sort((a, b) => a.move - b.move)[0];
     const tp1 = positions.filter(x => Number(x.tp1_hit)).length;
@@ -2971,32 +2642,29 @@ async function handlePositionsCommand(chatId, env) {
       "📊 *LIVE OPEN SIGNAL POSITIONS*",
       "",
       "━━━━━━━━━━━━━━━━━━",
-      "",
-      `📌 Total Open: *${positions.length}*`,
+      `📌 Open Positions: *${positions.length}*`,
       `🟢 Profitable: *${profitable}*`,
       `🔴 Losing: *${losing}*`,
       `⚪ Flat: *${flat}*`,
       "",
-      `💰 Current Profit: *+${currentProfit.toFixed(2)}%*`,
-      `📉 Current Loss: *${currentLoss.toFixed(2)}%*`,
-      `📊 Net P/L (10X): *${currentNet >= 0 ? "+" : ""}${currentNet.toFixed(2)}%*`,
+      `📈 Total Profit % (10X): *+${currentProfit.toFixed(2)}%*`,
+      `📉 Total Loss % (10X): *-${currentLoss.toFixed(2)}%*`,
+      `💰 Net P/L (10X): *${currentNet >= 0 ? "+" : ""}${currentNet.toFixed(2)}%*`,
       "",
-      "🎯 *TARGET SUMMARY*",
-      `TP1 Hits: *${tp1}*`,
-      `TP2 Hits: *${tp2}*`,
-      `TP3 Hits: *${tp3}*`,
+      `🎯 TP1 Hits: *${tp1}*`,
+      `🎯 TP2 Hits: *${tp2}*`,
+      `🎯 TP3 Hits: *${tp3}*`,
       "",
       best ? `🏆 Best Current: #${best.index} *${best.move >= 0 ? "+" : ""}${best.move.toFixed(2)}%*` : "🏆 Best Current: N/A",
       worst ? `📉 Worst Current: #${worst.index} *${worst.move >= 0 ? "+" : ""}${worst.move.toFixed(2)}%*` : "📉 Worst Current: N/A"
     ].join("\n");
 
+    // Never split a position block across Telegram messages.
     const MAX = 3800;
     const pages = [];
     let page = "";
     for (const row of rows) {
-      const candidate = page
-        ? page + "\n\n━━━━━━━━━━━━━━━━━━\n\n" + row.block
-        : row.block;
+      const candidate = page ? page + "\n\n━━━━━━━━━━━━━━━━━━\n\n" + row.block : row.block;
       if (candidate.length > MAX && page) {
         pages.push(page);
         page = row.block;
@@ -3008,13 +2676,13 @@ async function handlePositionsCommand(chatId, env) {
 
     for (let i = 0; i < pages.length; i++) {
       const header = i === 0
-        ? summary + `\n\n━━━━━━━━━━━━━━━━━━\n\n📋 *POSITION DETAILS — PAGE ${i + 1}/${pages.length}*`
+        ? summary + `\n\n━━━━━━━━━━━━━━━━━━\n📋 *POSITION DETAILS — PAGE ${i + 1}/${pages.length}*`
         : `📊 *LIVE OPEN SIGNAL POSITIONS*\n\n📋 *POSITION DETAILS — PAGE ${i + 1}/${pages.length}*`;
       await sendTelegram(env, chatId, header + "\n\n" + pages[i]);
     }
 
     await sendTelegram(env, chatId,
-      "ℹ️ *P/L calculation:* signal price movement × 10X leverage convention.\n" +
+      "\nℹ️ *P/L calculation:* signal price movement × 10X leverage convention.\n" +
       "This is not broker/account wallet P/L."
     );
   } catch (error) {
@@ -3528,6 +3196,117 @@ async function syncOkxMonitorDurableObject(env) {
   }
 }
 
+async function getMonitorStub(env) {
+  if (!env.OKX_MONITOR) return null;
+  const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
+  return env.OKX_MONITOR.get(id);
+}
+
+async function getMarketSnapshot(env) {
+  try {
+    const stub = await getMonitorStub(env);
+    if (!stub) return null;
+    const response = await stub.fetch("https://okx-monitor/market-snapshot");
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (error) {
+    console.error("MARKET SNAPSHOT READ ERROR", error);
+    return null;
+  }
+}
+
+async function saveMarketSnapshot(env, tickers) {
+  try {
+    const stub = await getMonitorStub(env);
+    if (!stub) return false;
+    const snapshot = (Array.isArray(tickers) ? tickers : []).filter(x => x?.instId && Number(x.last) > 0).map(x => ({
+      instId: x.instId,
+      last: Number(x.last),
+      vol24h: Number(x.vol24h || 0),
+      volCcy24h: Number(x.volCcy24h || 0)
+    }));
+    const response = await stub.fetch("https://okx-monitor/market-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ts: Date.now(), tickers: snapshot })
+    });
+    return response.ok;
+  } catch (error) {
+    console.error("MARKET SNAPSHOT SAVE ERROR", error);
+    return false;
+  }
+}
+
+async function runRapidMoveJob(env, tickers) {
+  if (!isEnabled(env, "SIGNALS_ENABLED", true) || !Array.isArray(tickers) || !tickers.length) return;
+  const previous = await getMarketSnapshot(env);
+  await saveMarketSnapshot(env, tickers);
+  if (!previous || !Array.isArray(previous.tickers)) return;
+
+  const now = Date.now();
+  const windowMs = (Number(getEnv(env, "RAPID_MOVE_WINDOW_MINUTES", String(DEFAULTS.RAPID_MOVE_WINDOW_MINUTES))) || 10) * 60000;
+  const age = now - Number(previous.ts || 0);
+  if (age < Math.max(5 * 60000, windowMs - 3 * 60000) || age > windowMs + 8 * 60000) return;
+
+  const threshold = Math.abs(Number(getEnv(env, "RAPID_MOVE_THRESHOLD_PCT", String(DEFAULTS.RAPID_MOVE_THRESHOLD_PCT))) || 10);
+  const oldMap = new Map(previous.tickers.map(x => [x.instId, x]));
+  const candidates = [];
+  for (const cur of tickers) {
+    const old = oldMap.get(cur.instId);
+    if (!old) continue;
+    const p0 = Number(old.last), p1 = Number(cur.last);
+    if (!(p0 > 0) || !(p1 > 0)) continue;
+    const move = ((p1 - p0) / p0) * 100;
+    if (Math.abs(move) < threshold) continue;
+    const v0 = Number(old.volCcy24h || old.vol24h || 0);
+    const v1 = Number(cur.volCcy24h || cur.vol24h || 0);
+    const volumeDelta = v1 > v0 && v0 > 0 ? ((v1 - v0) / v0) * 100 : null;
+    candidates.push({ symbol: cur.instId, move, p0, p1, v0, v1, volumeDelta });
+  }
+  candidates.sort((a,b) => Math.abs(b.move) - Math.abs(a.move));
+  const maxPosts = Number(getEnv(env, "RAPID_MOVE_MAX_POSTS_PER_RUN", String(DEFAULTS.RAPID_MOVE_MAX_POSTS_PER_RUN))) || 3;
+  let posted = 0;
+  for (const c of candidates.slice(0, maxPosts)) {
+    const direction = c.move >= 0 ? "PUMP" : "DUMP";
+    const key = `rapid:${c.symbol}:${direction}:${Math.floor(now / windowMs)}`;
+    if (!(await claimNewsFingerprint(env, key, Math.max(windowMs * 2, 20 * 60000)))) continue;
+    const coin = c.symbol.replace("-USDT-SWAP", "");
+    const volumeText = c.volumeDelta === null ? "n/a" : (c.volumeDelta >= 0 ? "+" : "") + c.volumeDelta.toFixed(1) + "%";
+    const text =
+      (direction === "PUMP" ? "🚀" : "🔻") + ` *RAPID ${direction} ALERT*\n\n` +
+      `📌 *${coin}/USDT*\n` +
+      `📊 Move: *${c.move >= 0 ? "+" : ""}${c.move.toFixed(2)}%*\n` +
+      `💰 Price: \`${fmt(c.p0)} → ${fmt(c.p1)}\`\n` +
+      `📈 24H Volume Change: *${volumeText}*\n` +
+      `⏱ Period: ~${Math.round(age / 60000)} minutes\n` +
+      `⚡ Activity: *${direction === "PUMP" ? "Buying pressure" : "Selling pressure"}*\n\n` +
+      `#${coin}USDT #BTCUSDT #BTC #CRYPTO`;
+    if (await sendPublicChannel(env, text)) posted++;
+  }
+  if (posted) console.log("RAPID MOVE POSTS", posted);
+}
+
+async function runDailyMarketLists(env, tickers) {
+  if (!isEnabled(env, "SIGNALS_ENABLED", true) || !Array.isArray(tickers) || !tickers.length) return;
+  const now = new Date();
+  const hour = Number(getEnv(env, "MARKET_LIST_HOUR_UTC", String(DEFAULTS.MARKET_LIST_HOUR_UTC))) || 0;
+  if (now.getUTCHours() !== hour || now.getUTCMinutes() >= 5) return;
+  const dayKey = now.toISOString().slice(0,10);
+  const topN = Number(getEnv(env, "MARKET_LIST_TOP_N", String(DEFAULTS.MARKET_LIST_TOP_N))) || 10;
+  const rows = tickers.filter(x => x?.instId?.endsWith("-USDT-SWAP") && Number(x.last) > 0 && Number.isFinite(pct24h(x)));
+  const gainers = rows.slice().sort((a,b) => pct24h(b)-pct24h(a)).slice(0, topN);
+  const losers = rows.slice().sort((a,b) => pct24h(a)-pct24h(b)).slice(0, topN);
+  const fmtRows = (list) => list.map((x,i) => `${i+1}. ${x.instId.replace("-USDT-SWAP", "")}/USDT — *${pct24h(x) >= 0 ? "+" : ""}${pct24h(x).toFixed(2)}%* — ${fmt(x.last)}`).join("\n");
+  const gainKey = `market-list:gainers:${dayKey}`;
+  if (await claimNewsFingerprint(env, gainKey, 48 * 60 * 60 * 1000)) {
+    await sendPublicChannel(env, `📈 *TOP GAINERS — DAILY*\n\n${fmtRows(gainers)}\n\n#CRYPTO #BTC #MARKET`);
+  }
+  const lossKey = `market-list:losers:${dayKey}`;
+  if (await claimNewsFingerprint(env, lossKey, 48 * 60 * 60 * 1000)) {
+    await sendPublicChannel(env, `📉 *TOP LOSERS — DAILY*\n\n${fmtRows(losers)}\n\n#CRYPTO #BTC #MARKET`);
+  }
+}
+
 function isSignalScanDue() {
   const minutes = new Date().getMinutes();
   const interval = Number(DEFAULTS.SIGNAL_SCAN_INTERVAL_MINUTES) || 15;
@@ -3559,15 +3338,17 @@ async function runScheduledJobs(env) {
     interval: Number(DEFAULTS.SIGNAL_SCAN_INTERVAL_MINUTES) || 15
   }));
 
-  if (signalDue) {
-    let okxTickers = null;
-    try {
-      if (isEnabled(env, "SIGNALS_ENABLED", true)) okxTickers = await getOkxTickers(env);
-    } catch (error) {
-      console.error("OKX TICKER SNAPSHOT ERROR", error);
-    }
+  let okxTickers = null;
+  try {
+    if (isEnabled(env, "SIGNALS_ENABLED", true)) okxTickers = await getOkxTickers(env);
+  } catch (error) {
+    console.error("OKX TICKER SNAPSHOT ERROR", error);
+  }
 
-    console.log("OKX TICKER SNAPSHOT", JSON.stringify({ count: Array.isArray(okxTickers) ? okxTickers.length : 0 }));
+  console.log("OKX TICKER SNAPSHOT", JSON.stringify({ count: Array.isArray(okxTickers) ? okxTickers.length : 0 }));
+  try { await runRapidMoveJob(env, okxTickers); } catch (error) { console.error("RAPID MOVE JOB ERROR", error); }
+  try { await runDailyMarketLists(env, okxTickers); } catch (error) { console.error("MARKET LIST JOB ERROR", error); }
+  if (signalDue) {
     try { await runSignalJob(env, okxTickers); } catch (error) { console.error("SIGNAL JOB ERROR", error); }
   }
 }
@@ -3589,6 +3370,7 @@ export class OkxMonitorDO extends DurableObject {
     this.reconnectAttempts = 0;
     this.heartbeatTimer = null;
     this.lastWsMessageAt = Date.now();
+    this.lastWsPingAt = 0;
     this.lastSyncAt = 0;
     this.tickerCache = new Map();
     this.tickersSubscribed = false;
@@ -3598,6 +3380,7 @@ export class OkxMonitorDO extends DurableObject {
     this.tickerReconnectAttempts = 0;
     this.tickerHeartbeatTimer = null;
     this.lastTickerWsMessageAt = Date.now();
+    this.lastTickerWsPingAt = 0;
     // D1 persistence is intentionally throttled because OKX candle5m sends
     // live updates repeatedly while a candle is forming. Monitoring/TP/SL
     // calculations stay real-time in memory; D1 is only persisted periodically.
@@ -3609,6 +3392,13 @@ export class OkxMonitorDO extends DurableObject {
     this.tpNotificationInFlight = new Set();
     this.tpNotificationReady = this.state.storage.list({ prefix: "tpnotify:" }).then(entries => {
       for (const key of entries.keys()) this.tpNotificationKeys.add(key);
+    }).catch(() => {});
+    this.closedPositions = new Map();
+    this.closedPositionReady = this.state.storage.list({ prefix: "closedpos:" }).then(entries => {
+      for (const [key, value] of entries) {
+        const id = key.slice("closedpos:".length);
+        this.closedPositions.set(id, value);
+      }
     }).catch(() => {});
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
@@ -3642,6 +3432,38 @@ export class OkxMonitorDO extends DurableObject {
         lastSyncAt: this.lastSyncAt
       }), { headers: { "Content-Type": "application/json" } });
     }
+    if (url.pathname === "/closed") {
+      await this.closedPositionReady;
+      return new Response(JSON.stringify({ ids: Array.from(this.closedPositions.keys()) }), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    if (url.pathname === "/market-snapshot") {
+      if (request.method === "GET") {
+        const snapshots = await this.state.storage.get("market_snapshots");
+        const list = Array.isArray(snapshots) ? snapshots : [];
+        const previous = list.length ? list[list.length - 1] : null;
+        return new Response(JSON.stringify(previous || {}), { headers: { "Content-Type": "application/json" } });
+      }
+      if (request.method === "POST") {
+        try {
+          const body = await request.json();
+          const current = { ts: Number(body?.ts || Date.now()), tickers: Array.isArray(body?.tickers) ? body.tickers : [] };
+          const existing = await this.state.storage.get("market_snapshots");
+          const list = Array.isArray(existing) ? existing : [];
+          list.push(current);
+          const cutoff = Date.now() - 30 * 60 * 1000;
+          const trimmed = list.filter(x => Number(x?.ts || 0) >= cutoff).slice(-6);
+          await this.state.storage.put("market_snapshots", trimmed);
+          // Return the snapshot immediately preceding the newly stored one.
+          const previous = trimmed.length > 1 ? trimmed[trimmed.length - 2] : null;
+          return new Response(JSON.stringify(previous || {}), { headers: { "Content-Type": "application/json" } });
+        } catch (error) {
+          console.error("MARKET SNAPSHOT WRITE ERROR", error);
+          return new Response(JSON.stringify({}), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+      }
+    }
     if (url.pathname === "/news-claim" && request.method === "POST") {
       try {
         const body = await request.json();
@@ -3674,6 +3496,7 @@ export class OkxMonitorDO extends DurableObject {
   async alarm() {
     try {
       await this.flushPositionsToD1();
+      await this.flushClosedToD1();
       await this.syncPositions();
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectWebSocket();
     } catch (error) {
@@ -3713,7 +3536,12 @@ export class OkxMonitorDO extends DurableObject {
 
       ws.addEventListener("message", async (event) => {
         this.lastWsMessageAt = Date.now();
-        await this.handleWsMessage(event.data);
+        const raw = event && event.data;
+        if (typeof raw === "string" && raw.toLowerCase() === "pong") {
+          console.log("OKX MONITOR WS PONG");
+          return;
+        }
+        await this.handleWsMessage(raw);
       });
 
       ws.addEventListener("close", (event) => {
@@ -3743,17 +3571,35 @@ export class OkxMonitorDO extends DurableObject {
 
   startHeartbeat() {
     this.stopHeartbeat();
+    this.lastWsPingAt = 0;
+    // OKX closes an otherwise quiet WebSocket after ~30s. Send the protocol
+    // ping regularly rather than waiting for the connection to become idle.
+    // Also keep a watchdog so a missing pong cannot leave a dead socket stuck.
     this.heartbeatTimer = setInterval(() => {
       try {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - this.lastWsMessageAt >= 25000) {
-          this.ws.send("ping");
-          console.log("OKX MONITOR WS HEARTBEAT");
+        const ws = this.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const now = Date.now();
+        const sinceMessage = now - Number(this.lastWsMessageAt || 0);
+        const sincePing = now - Number(this.lastWsPingAt || 0);
+
+        if (sincePing >= 15000) {
+          ws.send("ping");
+          this.lastWsPingAt = now;
+          console.log("OKX MONITOR WS HEARTBEAT", JSON.stringify({ sinceMessageMs: sinceMessage }));
+        }
+
+        // If OKX does not answer any ping/message for ~28s, force a clean
+        // reconnect before the server's 30s idle timeout can kill the socket.
+        if (sinceMessage >= 28000) {
+          console.warn("OKX MONITOR WS STALE", JSON.stringify({ sinceMessageMs: sinceMessage }));
+          try { ws.close(4000, "heartbeat timeout"); } catch (_) {}
         }
       } catch (error) {
         console.error("OKX MONITOR WS HEARTBEAT ERROR", error);
       }
-    }, 10000);
+    }, 5000);
   }
 
   stopHeartbeat() {
@@ -3818,17 +3664,27 @@ export class OkxMonitorDO extends DurableObject {
   startTickerHeartbeat() {
     this.stopTickerHeartbeat();
     this.lastTickerWsMessageAt = Date.now();
+    this.lastTickerWsPingAt = 0;
     this.tickerHeartbeatTimer = setInterval(() => {
       try {
-        if (!this.tickerWs || this.tickerWs.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - this.lastTickerWsMessageAt >= 20000) {
-          this.tickerWs.send("ping");
-          console.log("OKX TICKER WS HEARTBEAT");
+        const ws = this.tickerWs;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
+        const sinceMessage = now - Number(this.lastTickerWsMessageAt || 0);
+        const sincePing = now - Number(this.lastTickerWsPingAt || 0);
+        if (sincePing >= 15000) {
+          ws.send("ping");
+          this.lastTickerWsPingAt = now;
+          console.log("OKX TICKER WS HEARTBEAT", JSON.stringify({ sinceMessageMs: sinceMessage }));
+        }
+        if (sinceMessage >= 28000) {
+          console.warn("OKX TICKER WS STALE", JSON.stringify({ sinceMessageMs: sinceMessage }));
+          try { ws.close(4000, "heartbeat timeout"); } catch (_) {}
         }
       } catch (error) {
         console.error("OKX TICKER WS HEARTBEAT ERROR", error);
       }
-    }, 10000);
+    }, 5000);
   }
 
   stopTickerHeartbeat() {
@@ -3879,7 +3735,11 @@ export class OkxMonitorDO extends DurableObject {
 
       ws.addEventListener("message", async (event) => {
         this.lastTickerWsMessageAt = Date.now();
-        await this.handleTickerWsMessage(event.data);
+        const raw = event && event.data;
+        if (typeof raw === "string" && raw.toLowerCase() === "pong") {
+          console.log("OKX TICKER WS PONG");
+        }
+        await this.handleTickerWsMessage(raw);
       });
 
       ws.addEventListener("close", (event) => {
@@ -3970,11 +3830,13 @@ export class OkxMonitorDO extends DurableObject {
 
   async syncPositions() {
     if (!this.env.DB || isD1WriteBlocked()) return;
+    await this.closedPositionReady;
     try {
       const result = await this.env.DB.prepare(`SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 100`).all();
       const rows = result && result.results ? result.results : [];
       const next = new Map();
       for (const row of rows) {
+        if (this.closedPositions.has(String(row.id))) continue;
         const existing = this.positions.get(row.symbol);
         next.set(row.symbol, {
           ...row,
@@ -4061,17 +3923,8 @@ export class OkxMonitorDO extends DurableObject {
       this.tpNotificationKeys.add(notifyKey);
 
       const pct = Math.abs((Number(hit.price)-Number(pos.entry_mid))/Number(pos.entry_mid))*1000;
-      const nextTarget = hit.name === "TP1" ? "TP2" : (hit.name === "TP2" ? "TP3" : "");
-      const msg =
-        "😊 *"+hit.name+" HIT* ✅\n\n"+
-        "📌 "+pos.pair+" — "+pos.direction+"\n"+
-        "🎯 Entry: `"+reportFmt(pos.entry_mid)+"`\n"+
-        "💰 Price: `"+reportFmt(hit.price)+"`\n"+
-        "📈 Profit: *+"+pct.toFixed(1)+"%*"+
-        (hit.name === "TP1"
-          ? "\n\n⚠️ SL moved to entry."
-          : "")+
-        (nextTarget ? "\n\n🎯 "+nextTarget+" coming soon..." : "\n\n🏆 Profit protection is active.");
+      const nextTarget = hit.name === "TP1" ? "TP2 coming soon ...." : (hit.name === "TP2" ? "TP3 coming soon ...." : "Position near final target.");
+      const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n\n🎯 Entry: `"+reportFmt(pos.entry_mid)+"`\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*\n\n"+nextTarget+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
       try {
         if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
       } finally {
@@ -4096,30 +3949,49 @@ export class OkxMonitorDO extends DurableObject {
     const peakPct = Math.max(0,reportMovePct(pos.direction,pos.entry_mid,peak)||0);
     const reportProfit = anyTp ? peakPct : realizedAtClose;
     const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
-    if (isD1WriteBlocked()) {
-      console.warn("OKX MONITOR CLOSE D1 BLOCK", symbol);
+    await this.closedPositionReady;
+    const closedKey = `closedpos:${Number(pos.id)}`;
+    if (this.closedPositions.has(String(pos.id))) return;
+    const closedState = {
+      id: Number(pos.id),
+      symbol: pos.symbol,
+      pair: pos.pair,
+      direction: pos.direction,
+      closePrice,
+      reportProfit,
+      peakPct,
+      reason,
+      tp1_hit: Number(pos.tp1_hit || 0),
+      tp2_hit: Number(pos.tp2_hit || 0),
+      tp3_hit: Number(pos.tp3_hit || 0),
+      highest_price: Number(pos.highest_price || pos.entry_mid),
+      lowest_price: Number(pos.lowest_price || pos.entry_mid),
+      channel_message_id: Number(pos.channel_message_id || 0),
+      closed_at: new Date().toISOString()
+    };
+    try { await this.state.storage.put(closedKey, closedState); } catch (e) {
+      console.error("OKX CLOSED STATE STORE ERROR", symbol, e);
       return;
     }
-    const claim=await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(Number(pos.id)).run();
-    if (Number(claim?.meta?.changes||0)!==1) return;
-    pos.status="CLOSING"; this.positions.delete(symbol); await this.reconcileSubscriptions(false);
+    this.closedPositions.set(String(pos.id), closedState);
+    pos.status="CLOSED"; this.positions.delete(symbol); await this.reconcileSubscriptions(false);
     const hitTargets = formatHitTargets(pos);
     const msg = anyTp
-      ? "😊 *SIGNAL CLOSED* ✅\n\n"+
-        "📌 "+pos.pair+" — "+pos.direction+"\n"+
-        "🎯 Entry: `"+reportFmt(pos.entry_mid)+"`\n"+
-        "💰 Closed Price: `"+reportFmt(peak)+"`\n"+
-        "📈 Best Profit: *+"+peakPct.toFixed(1)+"%*"+
-        (hitTargets ? "\n\n🎯 "+hitTargets : "")+
-        "\n\n🔒 Profit Protected"
-      : "😔 *SL HIT* ❌\n\n"+
-        "📌 "+pos.pair+" — "+pos.direction+"\n"+
-        "🎯 Entry: `"+reportFmt(pos.entry_mid)+"`\n"+
-        "🛑 SL Price: `"+reportFmt(closePrice)+"`\n"+
-        "📉 Loss: *"+(realizedAtClose > 0 ? "+" : "")+realizedAtClose.toFixed(1)+"%*";
-    try { if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id); }
-    finally {
-      await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSED',closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(closePrice,reportProfit,peakPct,reason,Number(pos.id)).run();
+      ? "🔒 *SIGNAL CLOSED*\n\n"+
+        "📌 "+pos.pair+" — "+pos.direction+"\n\n"+
+        "💰 Closed Price: `"+reportFmt(closePrice)+"`\n"+
+        "📊 Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
+        "🏆 Highest Favorable Price: `"+reportFmt(peak)+"`\n"+
+        "🏆 Highest Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
+        (hitTargets ? "🎯 Targets Hit: *"+hitTargets+"*\n\n" : "")+
+        "🔒 *Profit Protected*\n🔒 Position Closed"
+      : "😔 *SL HIT*\n\n"+
+        "📌 "+pos.pair+" — "+pos.direction+"\n\n"+
+        "💰 SL Price: `"+reportFmt(closePrice)+"`\n"+
+        "📉 Loss: *"+(realizedAtClose>=0?"+":"")+realizedAtClose.toFixed(1)+"%*\n\n"+
+        "🔒 Position Closed";
+    try { if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id); } finally {
+      await this.flushClosedToD1();
     }
   }
 
@@ -4161,17 +4033,67 @@ export class OkxMonitorDO extends DurableObject {
     }
   }
 
+  async flushClosedToD1() {
+    if (!this.env.DB || isD1WriteBlocked()) return;
+    await this.closedPositionReady;
+    for (const [id, state] of this.closedPositions) {
+      try {
+        const r = await this.env.DB.prepare(`UPDATE signal_positions SET status='CLOSED',tp1_hit=?,tp2_hit=?,tp3_hit=?,highest_price=?,lowest_price=?,closed_at=?,close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=?`).bind(
+          Number(state.tp1_hit || 0), Number(state.tp2_hit || 0), Number(state.tp3_hit || 0),
+          Number(state.highest_price || 0), Number(state.lowest_price || 0), state.closed_at || new Date().toISOString(),
+          Number(state.closePrice || 0), Number(state.reportProfit || 0), Number(state.peakPct || 0), state.reason || "", Number(id)
+        ).run();
+        if (Number(r?.meta?.changes || 0) >= 1) {
+          await this.state.storage.delete(`closedpos:${id}`);
+          this.closedPositions.delete(id);
+        }
+      } catch (error) {
+        if (blockD1Writes(error, "flushClosedToD1")) return;
+        console.error("OKX CLOSED POSITION PERSIST ERROR", id, error);
+      }
+    }
+  }
+
   async flushPositionsToD1() {
     for (const pos of this.positions.values()) {
       await this.persistPosition(pos, true);
     }
   }
-  */
 }
 
 /* ============================================================
    TELEGRAM API
 ============================================================ */
+
+async function sendTelegramReply(env, text, replyToMessageId) {
+  const channel = getEnv(env, "CHANNEL_CHAT_ID", DEFAULTS.CHANNEL_CHAT_ID);
+  if (!channel || !env.TELEGRAM_BOT_TOKEN || !replyToMessageId) return false;
+
+  const body = {
+    chat_id: channel,
+    text: text,
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_to_message_id: Number(replyToMessageId),
+    allow_sending_without_reply: true
+  };
+
+  try {
+    const response = await fetch(
+      "https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/sendMessage",
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }
+    );
+    if (!response.ok) {
+      console.error("TELEGRAM REPLY ERROR", response.status, await response.text());
+      return false;
+    }
+    const data = await response.json();
+    return !!(data && data.ok);
+  } catch (error) {
+    console.error("TELEGRAM REPLY FETCH ERROR", error);
+    return false;
+  }
+}
 
 async function sendTelegram(env, chatId, text, replyMarkup) {
   if (!env.TELEGRAM_BOT_TOKEN) {
