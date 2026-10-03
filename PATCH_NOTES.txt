@@ -1,0 +1,9 @@
+MultiQuant production patch
+
+1. D1 daily-write circuit breaker no longer blocks live OKX position close decisions.
+2. Close state is kept in Durable Object storage while D1 persistence is deferred/retried.
+3. Stale OPEN rows are not resurrected when a local close marker exists.
+4. TP replies use: happy face + check mark, hit time, price, profit, with spacing.
+5. Close/SL replies include exit/SL hit time and only targets actually hit; no red X targets.
+6. /positions target status also lists only targets actually hit.
+7. Existing signal-generation logic and wrangler configuration were not intentionally changed.
