@@ -1,9 +1,9 @@
 {
   "name": "multiquant-bot",
   "private": true,
-  "type": "module",
   "version": "1.0.0",
   "description": "MultiQuant Academy Telegram + OKX + Gemini Cloudflare Worker",
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
