@@ -3360,6 +3360,11 @@ export class OkxMonitorDO extends DurableObject {
     this.tickerReconnectAttempts = 0;
     this.tickerHeartbeatTimer = null;
     this.lastTickerWsMessageAt = Date.now();
+    // D1 persistence is intentionally throttled because OKX candle5m sends
+    // live updates repeatedly while a candle is forming. Monitoring/TP/SL
+    // calculations stay real-time in memory; D1 is only persisted periodically.
+    this.lastPersistAt = new Map();
+    this.persistIntervalMs = 30 * 1000;
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
     this.connectWebSocket();
@@ -3797,16 +3802,46 @@ export class OkxMonitorDO extends DurableObject {
     }
   }
 
-  async persistPosition(pos) {
-    if (!this.env.DB) return;
-    await this.env.DB.prepare(`
-      UPDATE signal_positions SET tp1_hit=?, tp2_hit=?, tp3_hit=?, highest_price=?, lowest_price=?, status=?, updated_at=datetime('now') WHERE id=?
-    `).bind(Number(pos.tp1_hit || 0), Number(pos.tp2_hit || 0), Number(pos.tp3_hit || 0), Number(pos.highest_price || pos.entry_mid), Number(pos.lowest_price || pos.entry_mid), pos.status || "OPEN", Number(pos.id)).run();
+  async persistPosition(pos, force = false) {
+    if (!this.env.DB || !pos || !pos.id) return false;
+
+    const id = Number(pos.id);
+    const now = Date.now();
+    const last = Number(this.lastPersistAt.get(id) || 0);
+
+    // OKX candle5m is a streaming channel: the current candle can generate
+    // many updates before it closes. Do not write every update to D1.
+    if (!force && now - last < this.persistIntervalMs) return false;
+
+    try {
+      await this.env.DB.prepare(`
+        UPDATE signal_positions SET tp1_hit=?, tp2_hit=?, tp3_hit=?, highest_price=?, lowest_price=?, status=?, updated_at=datetime('now') WHERE id=?
+      `).bind(
+        Number(pos.tp1_hit || 0),
+        Number(pos.tp2_hit || 0),
+        Number(pos.tp3_hit || 0),
+        Number(pos.highest_price || pos.entry_mid),
+        Number(pos.lowest_price || pos.entry_mid),
+        pos.status || "OPEN",
+        id
+      ).run();
+
+      this.lastPersistAt.set(id, now);
+      return true;
+    } catch (error) {
+      // Persistence failure must NEVER stop real-time TP/SL monitoring.
+      console.error("OKX MONITOR POSITION PERSIST ERROR", JSON.stringify({
+        id,
+        symbol: pos.symbol,
+        error: error && error.message ? error.message : String(error)
+      }));
+      return false;
+    }
   }
 
   async flushPositionsToD1() {
     for (const pos of this.positions.values()) {
-      try { await this.persistPosition(pos); } catch (error) { console.error("OKX MONITOR POSITION FLUSH ERROR", pos.symbol, error); }
+      await this.persistPosition(pos, true);
     }
   }
 }
