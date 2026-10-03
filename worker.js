@@ -2883,6 +2883,7 @@ async function handlePositionsCommand(chatId, env) {
   try {
     await ensureSchema(env);
     let positions = [];
+    let monitorReadOk = false;
     if (env.OKX_MONITOR) {
       try {
         const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
@@ -2890,16 +2891,19 @@ async function handlePositionsCommand(chatId, env) {
         const r = await stub.fetch("https://okx-monitor/positions");
         if (r.ok) {
           const data = await r.json();
-          if (Array.isArray(data?.positions)) positions = data.positions;
+          if (Array.isArray(data?.positions)) {
+            positions = data.positions;
+            monitorReadOk = true;
+          }
         }
       } catch (error) {
         console.error("POSITIONS DO READ ERROR", error);
       }
     }
-    // Fallback only when the monitor cannot be reached. The live DO state is
-    // preferred because a D1 write can be temporarily blocked after Telegram
-    // has already confirmed a position close.
-    if (!positions.length && env.OKX_MONITOR) {
+    // D1 is ONLY a fallback when the Durable Object itself cannot be reached.
+    // If the DO successfully returns an empty list, that means there are no
+    // live positions; never resurrect stale D1 OPEN rows.
+    if (!monitorReadOk) {
       const result = await env.DB.prepare(`SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 50`).all();
       positions = result?.results || [];
     }
@@ -2925,16 +2929,20 @@ async function handlePositionsCommand(chatId, env) {
         move,
         block: [
           `━━━━━━━━━━━━━━━━━━`,
-          `📌 *${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}*`,
-          `📅 Open: ${opened.date}  ${opened.time}`,
+          `*${i + 1}. ${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}*`,
+          `📅 Open Date: ${opened.date}`,
+          `⏰ Open Time: ${opened.time}`,
+          ``,
           `🎯 Entry: ${reportFmt(pos.entry_mid)}`,
           `💰 Current: ${reportFmt(current)}`,
           `📈 Current P/L: ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
+          ``,
           `🎯 TP1: ${reportFmt(pos.tp1_price)}`,
           `🎯 TP2: ${reportFmt(pos.tp2_price)}`,
           `🎯 TP3: ${reportFmt(pos.tp3_price)}`,
           `🛑 SL: ${reportFmt(pos.sl_price)}`,
-          hitTargets ? `✅ Targets: ${hitTargets}` : "",
+          hitTargets ? `🎯 ${hitTargets}` : "",
+          ``,
           `🏆 Best Move: ${peakMove === null ? "N/A" : (peakMove >= 0 ? "+" : "") + peakMove.toFixed(2) + "%"}`
         ].filter(Boolean).join("\n")
       };
@@ -2973,7 +2981,7 @@ async function handlePositionsCommand(chatId, env) {
       `━━━━━━━━━━━━━━━━━━`
     ].join("\n");
 
-    const MAX = 3800;
+    const MAX = 3000;
     const pages = [];
     let page = "";
     for (const row of rows) {
@@ -3505,8 +3513,12 @@ export class OkxMonitorDO extends DurableObject {
     // TP notifications must remain idempotent even if D1 is unavailable or
     // the Durable Object is restarted. These keys live in DO storage, not D1.
     this.tpNotificationKeys = new Set();
+    this.closedPositionKeys = new Set();
     this.tpNotificationReady = this.state.storage.list({ prefix: "tpnotify:" }).then(entries => {
       for (const key of entries.keys()) this.tpNotificationKeys.add(key);
+    }).catch(() => {});
+    this.closedPositionReady = this.state.storage.list({ prefix: "closed:" }).then(entries => {
+      for (const key of entries.keys()) this.closedPositionKeys.add(key);
     }).catch(() => {});
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
@@ -3568,6 +3580,7 @@ export class OkxMonitorDO extends DurableObject {
 
   async alarm() {
     try {
+      await this.flushClosedToD1();
       await this.flushPositionsToD1();
       await this.syncPositions();
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) this.connectWebSocket();
@@ -3869,7 +3882,10 @@ export class OkxMonitorDO extends DurableObject {
       const result = await this.env.DB.prepare(`SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 100`).all();
       const rows = result && result.results ? result.results : [];
       const next = new Map();
+      await this.closedPositionReady;
       for (const row of rows) {
+        const closedKey = `closed:${Number(row.id)}`;
+        if (this.closedPositionKeys.has(closedKey)) continue;
         const existing = this.positions.get(row.symbol);
         next.set(row.symbol, {
           ...row,
@@ -4030,33 +4046,38 @@ export class OkxMonitorDO extends DurableObject {
     );
     if (tp3JustHit) return;
 
-    if (isD1WriteBlocked()) {
-      console.warn("OKX MONITOR CLOSE D1 BLOCK", symbol);
-      return;
-    }
-
-    const closeClaim = await this.env.DB.prepare(
-      "UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'"
-    ).bind(Number(pos.id)).run();
-    if (Number(closeClaim?.meta?.changes || 0) !== 1) return;
-
-    pos.status = "CLOSING";
-    this.positions.delete(symbol);
-    await this.reconcileSubscriptions(false);
+    // D1 must NEVER be the gate for a real-time close. Claim the close in
+    // Durable Object storage first so the position can close even while the
+    // D1 free-tier write circuit is blocked.
+    await this.closedPositionReady;
+    const closeKey = `closed:${Number(pos.id)}`;
+    if (this.closedPositionKeys.has(closeKey)) return;
+    try {
+      const existingClose = await this.state.storage.get(closeKey);
+      if (existingClose) {
+        this.closedPositionKeys.add(closeKey);
+        this.positions.delete(symbol);
+        await this.reconcileSubscriptions(false);
+        return;
+      }
+    } catch (_) {}
 
     const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
     const peakPct = Math.max(0, reportMovePct(pos.direction, pos.entry_mid, peak) || 0);
     const highestProfit = Math.max(0, peakPct);
-    const closePrice = anyTp ? peak : effectiveStop;
+    // If price moved in the trader's favour at any point, the protected close
+    // is reported at that best favourable price, even when no TP was reached.
+    const hadFavorableMove = highestProfit > 0;
+    const closePrice = hadFavorableMove ? peak : effectiveStop;
     const realizedAtClose = reportMovePct(pos.direction, pos.entry_mid, closePrice);
-    const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
+    const reason = hadFavorableMove ? "Trailing/Reversal" : "Direct SL";
     const hitTargets = [
       Number(pos.tp1_hit) ? "TP1 ✅" : "",
       Number(pos.tp2_hit) ? "TP2 ✅" : "",
       Number(pos.tp3_hit) ? "TP3 ✅" : ""
     ].filter(Boolean).join("   ");
 
-    const msg = anyTp
+    const msg = hadFavorableMove
       ? "😊 *SIGNAL CLOSED ✅*\n\n" +
         "📌 " + pos.pair + " — " + pos.direction + "\n" +
         "🎯 Entry: `" + reportFmt(pos.entry_mid) + "`\n" +
@@ -4076,33 +4097,89 @@ export class OkxMonitorDO extends DurableObject {
       : false;
 
     if (!closeSent) {
-      // Do not permanently close a position when the required Telegram reply
-      // could not be delivered. Put it back into the live monitor so the next
-      // candle can retry the close notification.
-      pos.status = "OPEN";
-      this.positions.set(symbol, pos);
-      await this.reconcileSubscriptions(false);
       console.warn("OKX CLOSE TELEGRAM RETRY", symbol);
       return;
     }
 
-    await this.env.DB.prepare(`
-      UPDATE signal_positions
-      SET status='CLOSED',
-          closed_at=datetime('now'),
-          close_price=?,
-          realized_profit_pct=?,
-          highest_profit_pct=?,
-          close_reason=?,
-          updated_at=datetime('now')
-      WHERE id=? AND status='CLOSING'
-    `).bind(
-      closePrice,
-      anyTp ? highestProfit : Math.max(0, Number(realizedAtClose) || 0),
-      highestProfit,
-      reason,
-      Number(pos.id)
-    ).run();
+    const closeRecord = {
+      id: Number(pos.id), symbol, closePrice, highestProfit,
+      realizedAtClose: Number(realizedAtClose || 0), reason,
+      closedAt: new Date().toISOString(),
+      tp1_hit: Number(pos.tp1_hit || 0), tp2_hit: Number(pos.tp2_hit || 0), tp3_hit: Number(pos.tp3_hit || 0)
+    };
+    try {
+      await this.state.storage.put(closeKey, closeRecord);
+      this.closedPositionKeys.add(closeKey);
+    } catch (storageError) {
+      console.error("OKX CLOSE LOCAL PERSIST ERROR", symbol, storageError);
+      return;
+    }
+
+    pos.status = "CLOSED";
+    this.positions.delete(symbol);
+    await this.reconcileSubscriptions(false);
+
+    // D1 is best-effort persistence only. If it is blocked, the local close
+    // record remains and flushClosedToD1() will reconcile it later.
+    if (!isD1WriteBlocked()) {
+      try {
+        await this.env.DB.prepare(`
+          UPDATE signal_positions
+          SET status='CLOSED',
+              closed_at=datetime('now'),
+              close_price=?,
+              realized_profit_pct=?,
+              highest_profit_pct=?,
+              close_reason=?,
+              tp1_hit=?, tp2_hit=?, tp3_hit=?,
+              updated_at=datetime('now')
+          WHERE id=? AND status IN ('OPEN','CLOSING')
+        `).bind(
+          closePrice,
+          hadFavorableMove ? highestProfit : Number(realizedAtClose || 0),
+          highestProfit,
+          reason,
+          Number(pos.tp1_hit || 0), Number(pos.tp2_hit || 0), Number(pos.tp3_hit || 0),
+          Number(pos.id)
+        ).run();
+        await this.state.storage.delete(closeKey);
+        this.closedPositionKeys.delete(closeKey);
+      } catch (d1Error) {
+        if (!blockD1Writes(d1Error, "okxClosePersist")) {
+          console.error("OKX CLOSE D1 DEFERRED", symbol, d1Error);
+        }
+      }
+    } else {
+      console.warn("OKX MONITOR CLOSE D1 DEFERRED", symbol);
+    }
+  }
+
+  async flushClosedToD1() {
+    if (!this.env.DB || isD1WriteBlocked()) return;
+    await this.closedPositionReady;
+    for (const key of Array.from(this.closedPositionKeys)) {
+      try {
+        const record = await this.state.storage.get(key);
+        if (!record) { this.closedPositionKeys.delete(key); continue; }
+        await this.env.DB.prepare(`
+          UPDATE signal_positions
+          SET status='CLOSED', closed_at=COALESCE(closed_at, datetime('now')),
+              close_price=?, realized_profit_pct=?, highest_profit_pct=?,
+              close_reason=?, tp1_hit=?, tp2_hit=?, tp3_hit=?, updated_at=datetime('now')
+          WHERE id=? AND status IN ('OPEN','CLOSING')
+        `).bind(
+          Number(record.closePrice), Number(record.realizedAtClose || 0),
+          Number(record.highestProfit || 0), String(record.reason || "Trailing/Reversal"),
+          Number(record.tp1_hit || 0), Number(record.tp2_hit || 0), Number(record.tp3_hit || 0),
+          Number(record.id)
+        ).run();
+        await this.state.storage.delete(key);
+        this.closedPositionKeys.delete(key);
+      } catch (error) {
+        if (blockD1Writes(error, "flushClosedToD1")) return;
+        console.error("OKX CLOSED POSITION FLUSH ERROR", key, error);
+      }
+    }
   }
 
   async persistPosition(pos, force = false) {
