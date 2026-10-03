@@ -1390,9 +1390,48 @@ function detectLanguage(text) {
    NEWS — RSS
 ============================================================ */
 
+let newsCooldownUntil = 0;
+let newsJobLockUntil = 0;
+
+async function getNewsCooldownRequest(env) {
+  const channel = getEnv(env, "CHANNEL_CHAT_ID", DEFAULTS.CHANNEL_CHAT_ID) || "default";
+  return new Request("https://multiquant-news-cooldown.invalid/" + encodeURIComponent(channel));
+}
+
+async function cacheHasNewsCooldown(env) {
+  try {
+    const req = await getNewsCooldownRequest(env);
+    const hit = await caches.default.match(req);
+    return !!hit;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function cacheSetNewsCooldown(env, seconds) {
+  try {
+    const req = await getNewsCooldownRequest(env);
+    await caches.default.put(req, new Response("1", {
+      headers: { "Cache-Control": "max-age=" + String(seconds) }
+    }));
+  } catch (_) {}
+}
+
 async function runNewsJob(env) {
   if (!isEnabled(env, "NEWS_ENABLED", true)) return;
+
+  const nowMs = Date.now();
+  if (nowMs < newsCooldownUntil || nowMs < newsJobLockUntil) return;
+  if (await cacheHasNewsCooldown(env)) {
+    newsCooldownUntil = Date.now() + 30 * 60 * 1000;
+    return;
+  }
   if (await hasRecentNewsPost(env, 30)) return;
+
+  // Prevent overlapping scheduled invocations from all publishing at once.
+  // This lock is intentionally short and is released on failure.
+  newsJobLockUntil = Date.now() + 2 * 60 * 1000;
+  await cacheSetNewsCooldown(env, 2 * 60);
 
   const feeds = getNewsFeeds(env);
   if (!feeds.length) return;
@@ -1457,21 +1496,47 @@ async function runNewsJob(env) {
 
       const sent = await sendNewsChannel(env, finalText);
       if (sent) {
-        await setMeta(env, key, "1");
-        await setMeta(env, "news:last_published", String(Date.now()));
+        newsCooldownUntil = Date.now() + 30 * 60 * 1000;
+        newsJobLockUntil = newsCooldownUntil;
+        await cacheSetNewsCooldown(env, 30 * 60);
+        // D1 metadata is now best-effort. The cache/local cooldown above
+        // prevents a D1 quota failure from causing a news blast.
+        try { await setMeta(env, key, "1"); } catch (_) {}
+        try { await setMeta(env, "news:last_published", String(Date.now())); } catch (_) {}
+      } else {
+        newsJobLockUntil = 0;
+        try {
+          const req = await getNewsCooldownRequest(env);
+          await caches.default.delete(req);
+        } catch (_) {}
       }
       return;
     } catch (error) {
       console.error("NEWS ITEM ERROR", error);
+      newsJobLockUntil = 0;
+      try {
+        const req = await getNewsCooldownRequest(env);
+        await caches.default.delete(req);
+      } catch (_) {}
     }
   }
 }
 
 async function hasRecentNewsPost(env, minutes) {
+  if (Date.now() < newsCooldownUntil) return true;
+  if (await cacheHasNewsCooldown(env)) {
+    newsCooldownUntil = Date.now() + Number(minutes) * 60000;
+    return true;
+  }
   if (!env.DB) return false;
-  const value = await getMeta(env, "news:last_published");
-  if (!value) return false;
-  return (Date.now() - Number(value)) < (Number(minutes) * 60000);
+  try {
+    const value = await getMeta(env, "news:last_published");
+    if (!value) return false;
+    return (Date.now() - Number(value)) < (Number(minutes) * 60000);
+  } catch (_) {
+    // If D1 is unavailable/exhausted, do not treat that as permission to post.
+    return true;
+  }
 }
 
 function isImpactfulNewsCandidate(item) {
@@ -3120,6 +3185,16 @@ async function ensureUser(env, telegramId, firstName, username) {
 
   await ensureSchema(env);
 
+  // This function is called for every Telegram message. Do not perform an
+  // INSERT ... ON CONFLICT UPDATE on every message: that consumes a D1 row
+  // write even when the user already exists. Existing users are updated by
+  // the normal conversation flow only when their data actually changes.
+  const existing = await env.DB.prepare(
+    "SELECT telegram_id FROM users WHERE telegram_id = ? LIMIT 1"
+  ).bind(telegramId).first();
+
+  if (existing) return;
+
   await env.DB.prepare(`
     INSERT INTO users (
       telegram_id,
@@ -3132,11 +3207,6 @@ async function ensureUser(env, telegramId, firstName, username) {
       last_interaction
     )
     VALUES (?, ?, ?, 'English', 'new', 'active', datetime('now'), datetime('now'))
-    ON CONFLICT(telegram_id)
-    DO UPDATE SET
-      first_name = excluded.first_name,
-      username = excluded.username,
-      last_interaction = datetime('now')
   `).bind(
     telegramId,
     firstName || "Friend",
@@ -3364,7 +3434,7 @@ export class OkxMonitorDO extends DurableObject {
     // live updates repeatedly while a candle is forming. Monitoring/TP/SL
     // calculations stay real-time in memory; D1 is only persisted periodically.
     this.lastPersistAt = new Map();
-    this.persistIntervalMs = 30 * 1000;
+    this.persistIntervalMs = 5 * 60 * 1000;
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
     this.connectWebSocket();
@@ -3772,7 +3842,10 @@ export class OkxMonitorDO extends DurableObject {
       const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*"+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
       if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
     }
-    await this.persistPosition(pos);
+
+    // Do not write position state to D1 on every live candle update.
+    // TP claims and closes already persist the critical state; normal
+    // high/low state is flushed periodically by the DO alarm.
 
     const anyTp = Number(pos.tp1_hit)||Number(pos.tp2_hit)||Number(pos.tp3_hit);
     let effectiveStop = Number(pos.sl_price);
