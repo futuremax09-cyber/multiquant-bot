@@ -129,8 +129,8 @@ const INTERESTS = {
   },
   forex_copy: {
     key: "forex_copy",
-    label: "Forex Copy Trading",
-    market: "Forex",
+    label: "Forex & Gold Copy Trading",
+    market: "Forex & Gold",
     tradingType: "Copy Trading",
     team: "forex"
   },
@@ -421,7 +421,7 @@ function privateInterestKeyboard(env) {
   return {
     inline_keyboard: [
       [{ text: "💱 Forex Trading", callback_data: "interest_forex" }],
-      [{ text: "📈 Copy Trading in Forex", callback_data: "interest_forex_copy" }],
+      [{ text: "📈 Copy Trading in Forex & Gold", callback_data: "interest_forex_copy" }],
       [{ text: "🇮🇳 Indian Stock Market", callback_data: "interest_stocks" }],
       [{ text: "₿ Crypto Premium Signals", callback_data: "interest_crypto_signals" }],
       [{ text: "🚀 Crypto Copy Trading", callback_data: "interest_crypto_copy" }]
@@ -1083,14 +1083,15 @@ function assignedTeam(user) {
 
   return {
     key: "forex",
-    label: "Forex Team",
+    label: containsAny(interest + " " + market, ["gold", "xauusd"]) ? "Forex & Gold Team" : "Forex Team",
     username: getEnvPlaceholder("FOREX_TEAM", DEFAULTS.FOREX_TEAM)
   };
 }
 
 function getTeamAlertChatId(env, team) {
-  if (env.TEAM_ALERT_CHAT_ID) return String(env.TEAM_ALERT_CHAT_ID);
-
+  // Prefer team-specific destinations when configured. Keep the existing
+  // TEAM_ALERT_CHAT_ID as the safe fallback so current deployments continue
+  // to work without changing their dashboard variables.
   if (team.key === "crypto" && env.CRYPTO_TEAM_CHAT_ID) {
     return String(env.CRYPTO_TEAM_CHAT_ID);
   }
@@ -1103,6 +1104,7 @@ function getTeamAlertChatId(env, team) {
     return String(env.STOCK_TEAM_CHAT_ID);
   }
 
+  if (env.TEAM_ALERT_CHAT_ID) return String(env.TEAM_ALERT_CHAT_ID);
   return String(env.ADMIN_CHAT_ID || "");
 }
 
@@ -1522,21 +1524,13 @@ async function runNewsJob(env) {
         escapeMarkdown(parsed.impact) + "\n\n" +
         "[🔗 Source](" + item.link.replace(/[)\\]/g, "") + ")";
 
-      // Claim the story in Durable Object storage immediately before publish.
-      // This remains effective even when D1 is temporarily read/write limited.
-      const dedupKey = titleKey || linkKey;
-      const claimed = await claimNewsFingerprint(env, dedupKey, 6 * 60 * 60 * 1000);
-      if (!claimed) continue;
-
       const sent = await sendNewsChannel(env, finalText);
       if (sent) {
-        // Store both URL and normalized-title fingerprints in D1 when available.
-        // The Durable Object claim above is the authoritative duplicate guard.
+        // Store both URL and normalized-title fingerprints. This prevents
+        // syndicated copies of the same story from being reposted.
         await setMeta(env, linkKey, "1");
         await setMeta(env, titleKey, "1");
         await setMeta(env, "news:last_published", String(Date.now()));
-      } else {
-        await releaseNewsFingerprint(env, dedupKey);
       }
       return;
     } catch (error) {
@@ -2306,10 +2300,6 @@ async function createSignalPosition(env, setup, messageId) {
 }
 
 async function monitorOpenSignals(env, tickers) {
-  // Legacy D1/ticker monitor intentionally disabled. OkxMonitorDO is the single
-  // authoritative TP/SL monitor; keeping a second engine risks duplicate alerts.
-  return;
-  /*
   if (!env.DB || !isEnabled(env, "SIGNALS_ENABLED", true)) return;
   try {
     await ensureSchema(env);
@@ -2400,7 +2390,7 @@ async function monitorOpenSignals(env, tickers) {
       if (Number(closeClaim?.meta?.changes || 0) !== 1) continue;
 
       const msg = anyTp
-        ? "🔒 *SIGNAL CLOSED*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 Closed Price: `" + reportFmt(closePrice) + "`\n📊 Profit: *+" + peakPct.toFixed(1) + "%*\n\n🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n🏆 Highest Profit: *+" + peakPct.toFixed(1) + "%*\n\n🎯 Targets Hit: *" + formatHitTargets(pos) + "*\n\n🔒 Position Closed
+        ? "🔒 *SIGNAL CLOSED*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 Closed Price: `" + reportFmt(closePrice) + "`\n📊 Profit: *+" + peakPct.toFixed(1) + "%*\n\n🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n🏆 Highest Profit: *+" + peakPct.toFixed(1) + "%*\n\n🎯 TP1 " + (tp1Hit?"✅":"❌") + "   TP2 " + (tp2Hit?"✅":"❌") + "   TP3 " + (tp3Hit?"✅":"❌")
         : "😔 *SL HIT*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n💰 SL Price: `" + reportFmt(closePrice) + "`\n📉 Loss: *" + (realizedAtClose >= 0 ? "+" : "") + realizedAtClose.toFixed(1) + "%*\n\n🔒 Position Closed";
       try {
         if (pos.channel_message_id) await sendTelegramReply(env, msg, pos.channel_message_id);
@@ -2420,8 +2410,10 @@ async function sendTelegramReply(env, text, replyToMessageId) {
     text: text,
     parse_mode: "Markdown",
     disable_web_page_preview: true,
-    reply_to_message_id: Number(replyToMessageId),
-    allow_sending_without_reply: true
+    reply_parameters: {
+      message_id: Number(replyToMessageId),
+      allow_sending_without_reply: false
+    }
   };
 
   try {
@@ -2431,10 +2423,11 @@ async function sendTelegramReply(env, text, replyToMessageId) {
       body: JSON.stringify(body)
     });
     if (!response.ok) {
-      console.error("TELEGRAM REPLY ERROR", await response.text());
+      console.error("TELEGRAM REPLY ERROR", response.status, await response.text());
       return false;
     }
-    return true;
+    const data = await response.json();
+    return !!(data && data.ok);
   } catch (error) {
     console.error("TELEGRAM REPLY FETCH ERROR", error);
     return false;
@@ -2883,46 +2876,17 @@ function reportDateTime(value) {
   return { date: `${parts.day}-${parts.month}-${parts.year}`, time: `${parts.hour}:${parts.minute}:${parts.second}` };
 }
 
-function formatHitTargets(pos) {
-  const hits = [];
-  if (Number(pos?.tp1_hit)) hits.push("TP1 ✅");
-  if (Number(pos?.tp2_hit)) hits.push("TP2 ✅");
-  if (Number(pos?.tp3_hit)) hits.push("TP3 ✅");
-  return hits.length ? hits.join("   ") : "None";
-}
-
 async function handlePositionsCommand(chatId, env) {
   if (!env.DB) return await sendTelegram(env, chatId, "❌ D1 database is not available.");
   try {
     await ensureSchema(env);
-    const result = await env.DB.prepare(`
-      SELECT * FROM signal_positions
-      WHERE status='OPEN'
-      ORDER BY id ASC
-      LIMIT 50
-    `).all();
+    const result = await env.DB.prepare(`SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 50`).all();
     const positions = result?.results || [];
-
-    if (!positions.length) {
-      return await sendTelegram(env, chatId,
-        "📊 *LIVE OPEN SIGNAL POSITIONS*\n\n" +
-        "━━━━━━━━━━━━━━━━━━\n" +
-        "No open positions."
-      );
-    }
+    if (!positions.length) return await sendTelegram(env, chatId, "📊 LIVE OPEN POSITIONS\n\nNo open positions.");
 
     let tickers = null;
-    try {
-      tickers = await getOkxTickers(env);
-    } catch (error) {
-      console.error("POSITIONS TICKER SNAPSHOT ERROR", error);
-    }
-
-    const tickerMap = new Map(
-      (tickers || [])
-        .filter(x => x?.instId && Number(x.last) > 0)
-        .map(x => [x.instId, Number(x.last)])
-    );
+    try { tickers = await getOkxTickers(env); } catch (error) { console.error("POSITIONS TICKER SNAPSHOT ERROR", error); }
+    const tickerMap = new Map((tickers || []).filter(x => x?.instId && Number(x.last) > 0).map(x => [x.instId, Number(x.last)]));
 
     const rows = positions.map((pos, i) => {
       const current = tickerMap.get(pos.symbol);
@@ -2930,64 +2894,55 @@ async function handlePositionsCommand(chatId, env) {
       const opened = reportDateTime(pos.created_at);
       const peak = pos.direction === "LONG" ? pos.highest_price : pos.lowest_price;
       const peakMove = reportMovePct(pos.direction, pos.entry_mid, peak);
-      const hitTargets = formatHitTargets(pos);
-
-      const block = [
-        `*${i + 1}. ${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}*`,
-        "",
-        `📅 Opened: ${opened.date}`,
-        `⏰ Time: ${opened.time}`,
-        `💰 Entry: ${reportFmt(pos.entry_mid)}`,
-        `📍 Current: ${reportFmt(current)}`,
-        `📊 Current P/L (10X): ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
-        "",
-        `🎯 TP1: ${reportFmt(pos.tp1_price)}`,
-        `🎯 TP2: ${reportFmt(pos.tp2_price)}`,
-        `🎯 TP3: ${reportFmt(pos.tp3_price)}`,
-        `🛑 SL: ${reportFmt(pos.sl_price)}`,
-        `✅ Targets Hit: ${hitTargets}`,
-        `🏆 Best Move (10X): ${peakMove === null ? "N/A" : (peakMove >= 0 ? "+" : "") + peakMove.toFixed(2) + "%"}`
-      ].join("\n");
-
-      return { index: i + 1, move, block };
+      return {
+        index: i + 1,
+        move,
+        block: [
+          `${i + 1}. ${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}`,
+          `📅 Open Date: ${opened.date}`,
+          `⏰ Open Time: ${opened.time}`,
+          `💰 Open Price: ${reportFmt(pos.entry_mid)}`,
+          `📍 Current Price: ${reportFmt(current)}`,
+          `📈 Current P/L: ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
+          `🎯 TP1: ${reportFmt(pos.tp1_price)}`,
+          `🎯 TP2: ${reportFmt(pos.tp2_price)}`,
+          `🎯 TP3: ${reportFmt(pos.tp3_price)}`,
+          `🛑 SL: ${reportFmt(pos.sl_price)}`,
+          `TP1 ${Number(pos.tp1_hit) ? "✅" : "❌"}    TP2 ${Number(pos.tp2_hit) ? "✅" : "❌"}    TP3 ${Number(pos.tp3_hit) ? "✅" : "❌"}`,
+          `🏆 Best Move: ${peakMove === null ? "N/A" : (peakMove >= 0 ? "+" : "") + peakMove.toFixed(2) + "%"}`
+        ].join("\n")
+      };
     });
 
-    const validMoves = rows.filter(x => x.move !== null);
-    const profitable = validMoves.filter(x => x.move > 0).length;
-    const losing = validMoves.filter(x => x.move < 0).length;
-    const flat = validMoves.filter(x => x.move === 0).length;
-    const currentNet = validMoves.reduce((sum, x) => sum + x.move, 0);
-    const best = validMoves.slice().sort((a, b) => b.move - a.move)[0];
-    const worst = validMoves.slice().sort((a, b) => a.move - b.move)[0];
+    const profitable = rows.filter(x => x.move !== null && x.move > 0).length;
+    const losing = rows.filter(x => x.move !== null && x.move < 0).length;
+    const flat = rows.filter(x => x.move !== null && x.move === 0).length;
+    const currentNet = rows.reduce((sum, x) => sum + (x.move === null ? 0 : x.move), 0);
+    const best = rows.filter(x => x.move !== null).sort((a,b) => b.move - a.move)[0];
+    const worst = rows.filter(x => x.move !== null).sort((a,b) => a.move - b.move)[0];
     const tp1 = positions.filter(x => Number(x.tp1_hit)).length;
     const tp2 = positions.filter(x => Number(x.tp2_hit)).length;
     const tp3 = positions.filter(x => Number(x.tp3_hit)).length;
 
     const summary = [
-      "📊 *LIVE OPEN SIGNAL POSITIONS*",
+      "📊 LIVE OPEN POSITIONS",
       "",
-      "━━━━━━━━━━━━━━━━━━",
-      `📌 Open Positions: *${positions.length}*`,
-      `🟢 Profitable: *${profitable}*`,
-      `🔴 Losing: *${losing}*`,
-      `⚪ Flat: *${flat}*`,
-      "",
-      `📈 Current Net P/L (10X): *${currentNet >= 0 ? "+" : ""}${currentNet.toFixed(2)}%*`,
-      "",
-      `🎯 TP1 Hits: *${tp1}*`,
-      `🎯 TP2 Hits: *${tp2}*`,
-      `🎯 TP3 Hits: *${tp3}*`,
-      "",
-      best ? `🏆 Best Current: #${best.index} *${best.move >= 0 ? "+" : ""}${best.move.toFixed(2)}%*` : "🏆 Best Current: N/A",
-      worst ? `📉 Worst Current: #${worst.index} *${worst.move >= 0 ? "+" : ""}${worst.move.toFixed(2)}%*` : "📉 Worst Current: N/A"
+      `Open Positions: ${positions.length}`,
+      `🟢 Profitable: ${profitable}`,
+      `🔴 Losing: ${losing}`,
+      `⚪ Flat: ${flat}`,
+      `📈 Current Net P/L: ${currentNet >= 0 ? "+" : ""}${currentNet.toFixed(2)}%`,
+      `🎯 TP1 Hits: ${tp1}   TP2 Hits: ${tp2}   TP3 Hits: ${tp3}`,
+      best ? `🏆 Best Current: #${best.index} ${best.move >= 0 ? "+" : ""}${best.move.toFixed(2)}%` : "🏆 Best Current: N/A",
+      worst ? `📉 Worst Current: #${worst.index} ${worst.move >= 0 ? "+" : ""}${worst.move.toFixed(2)}%` : "📉 Worst Current: N/A"
     ].join("\n");
 
-    // Never split a position block across Telegram messages.
+    // Keep every position intact. Never split a signal block across Telegram messages.
     const MAX = 3800;
     const pages = [];
     let page = "";
     for (const row of rows) {
-      const candidate = page ? page + "\n\n━━━━━━━━━━━━━━━━━━\n\n" + row.block : row.block;
+      const candidate = page ? page + "\n\n" + row.block : row.block;
       if (candidate.length > MAX && page) {
         pages.push(page);
         page = row.block;
@@ -2999,15 +2954,11 @@ async function handlePositionsCommand(chatId, env) {
 
     for (let i = 0; i < pages.length; i++) {
       const header = i === 0
-        ? summary + `\n\n━━━━━━━━━━━━━━━━━━\n📋 *POSITION DETAILS — PAGE ${i + 1}/${pages.length}*`
-        : `📊 *LIVE OPEN SIGNAL POSITIONS*\n\n📋 *POSITION DETAILS — PAGE ${i + 1}/${pages.length}*`;
+        ? summary + `\n\n━━━━━━━━━━━━━━━━━━\n📋 SIGNALS — PAGE ${i + 1}/${pages.length}`
+        : `📊 LIVE OPEN POSITIONS\n\n📋 SIGNALS — PAGE ${i + 1}/${pages.length}`;
       await sendTelegram(env, chatId, header + "\n\n" + pages[i]);
     }
-
-    await sendTelegram(env, chatId,
-      "\nℹ️ *P/L calculation:* signal price movement × 10X leverage convention.\n" +
-      "This is not broker/account wallet P/L."
-    );
+    await sendTelegram(env, chatId, "\n⚠️ P/L is signal price-move × 10 convention, not broker/account P&L.");
   } catch (error) {
     console.error("POSITIONS COMMAND ERROR", error);
     await sendTelegram(env, chatId, "❌ /positions error. Check Worker logs.");
@@ -3018,129 +2969,73 @@ async function handleTradeReportCommand(chatId, env, period) {
   if (!env.DB) return await sendTelegram(env, chatId, "❌ D1 database is not available.");
   try {
     await ensureSchema(env);
-
     const where = period === "weekly"
       ? "closed_at >= datetime('now','-7 days')"
       : "closed_at >= datetime('now','+5 hours 30 minutes','start of month','-5 hours 30 minutes')";
     const label = period === "weekly" ? "LAST 7 DAYS" : "CURRENT MONTH";
-
-    const result = await env.DB.prepare(`
-      SELECT * FROM signal_positions
-      WHERE status='CLOSED'
-        AND closed_at IS NOT NULL
-        AND ${where}
-      ORDER BY closed_at ASC
-    `).all();
-
+    const result = await env.DB.prepare(`SELECT * FROM signal_positions WHERE status='CLOSED' AND closed_at IS NOT NULL AND ${where} ORDER BY closed_at ASC`).all();
     const closed = result?.results || [];
-    const openResult = await env.DB.prepare(
-      "SELECT COUNT(*) AS c FROM signal_positions WHERE status='OPEN'"
-    ).first();
+    const openResult = await env.DB.prepare("SELECT COUNT(*) AS c FROM signal_positions WHERE status='OPEN'").first();
     const openCount = Number(openResult?.c || 0);
-
+    const total = closed.length;
     const reportProfitFor = (x) => {
       const stored = Number(x.realized_profit_pct || 0);
       const peak = Number(x.highest_profit_pct || 0);
-      return String(x.close_reason || "").toLowerCase() === "direct sl"
-        ? stored
-        : Math.max(stored, peak);
+      return String(x.close_reason || "").toLowerCase() === "direct sl" ? stored : Math.max(stored, peak);
     };
-
     const wins = closed.filter(x => reportProfitFor(x) > 0).length;
     const losses = closed.filter(x => reportProfitFor(x) < 0).length;
-    const flat = closed.filter(x => reportProfitFor(x) === 0).length;
-    const grossProfit = closed.reduce((a, x) => a + Math.max(0, reportProfitFor(x)), 0);
-    const grossLoss = closed.reduce((a, x) => a + Math.min(0, reportProfitFor(x)), 0);
+    const grossProfit = closed.reduce((a,x) => a + Math.max(0, reportProfitFor(x)), 0);
+    const grossLoss = closed.reduce((a,x) => a + Math.min(0, reportProfitFor(x)), 0);
     const net = grossProfit + grossLoss;
-    const winRate = closed.length ? (wins / closed.length) * 100 : 0;
+    const winRate = total ? wins / total * 100 : 0;
     const tp1 = closed.filter(x => Number(x.tp1_hit)).length;
     const tp2 = closed.filter(x => Number(x.tp2_hit)).length;
     const tp3 = closed.filter(x => Number(x.tp3_hit)).length;
     const directSl = closed.filter(x => String(x.close_reason) === "Direct SL").length;
     const trailing = closed.filter(x => String(x.close_reason) === "Trailing/Reversal").length;
-    const sorted = closed.slice().sort((a, b) => reportProfitFor(b) - reportProfitFor(a));
-    const best = sorted[0];
-    const worst = sorted[sorted.length - 1];
+    const sorted = closed.slice().sort((a,b) => reportProfitFor(b)-reportProfitFor(a));
+    const best = sorted[0], worst = sorted[sorted.length - 1];
 
     const lines = [
-      `📊 *${label} TRADE REPORT*`,
-      "",
-      "━━━━━━━━━━━━━━━━━━",
-      period === "weekly" ? "📅 Period: Last 7 Days" : "📅 Period: Current Calendar Month",
-      "",
-      `📌 Total Closed: *${closed.length}*`,
-      `📂 Open Positions: *${openCount}*`,
-      `🟢 Profitable: *${wins}*`,
-      `🔴 Losing: *${losses}*`,
-      `⚪ Flat: *${flat}*`,
-      `📈 Win Rate: *${winRate.toFixed(1)}%*`,
-      "",
-      `💰 Gross Profit (10X): *+${grossProfit.toFixed(2)}%*`,
-      `📉 Gross Loss (10X): *${grossLoss.toFixed(2)}%*`,
-      `📊 Net P/L (10X): *${net >= 0 ? "+" : ""}${net.toFixed(2)}%*`,
-      "",
-      "🎯 *TARGET SUMMARY*",
-      `TP1 Hits: *${tp1}*`,
-      `TP2 Hits: *${tp2}*`,
-      `TP3 Hits: *${tp3}*`,
-      "",
-      "🔒 *CLOSURE SUMMARY*",
-      `Direct SL: *${directSl}*`,
-      `Trailing / Reversal: *${trailing}*`
+      `📊 ${label} TRADE REPORT`, "",
+      period === "weekly" ? "Period: Last 7 days" : "Period: Current calendar month",
+      `Total Closed: ${total}`,
+      `Open Positions: ${openCount}`,
+      `Profitable: ${wins} | Losing: ${losses}`,
+      `Win Rate: ${winRate.toFixed(1)}%`, "",
+      `💰 Gross Profit: +${grossProfit.toFixed(2)}%`,
+      `📉 Gross Loss: ${grossLoss.toFixed(2)}%`,
+      `📊 Net P/L: ${net >= 0 ? "+" : ""}${net.toFixed(2)}%`, "",
+      `🎯 TP1 Hits: ${tp1}`,
+      `🎯 TP2 Hits: ${tp2}`,
+      `🎯 TP3 Hits: ${tp3}`,
+      `😔 Direct SL: ${directSl}`,
+      `🔒 Trailing/Reversal: ${trailing}`
     ];
-
-    if (best) {
-      const bp = reportProfitFor(best);
-      lines.push("", `🏆 Best Trade: *${best.pair} — ${best.direction}*`, `Profit: *${bp >= 0 ? "+" : ""}${bp.toFixed(2)}%*`);
-    }
-    if (worst) {
-      const wp = reportProfitFor(worst);
-      lines.push("", `📉 Worst Trade: *${worst.pair} — ${worst.direction}*`, `P/L: *${wp >= 0 ? "+" : ""}${wp.toFixed(2)}%*`);
-    }
+    if (best) { const bp = reportProfitFor(best); lines.push("", `🏆 Best: ${best.pair} ${best.direction} ${bp>=0?"+":""}${bp.toFixed(2)}%`); }
+    if (worst) { const wp = reportProfitFor(worst); lines.push(`📉 Worst: ${worst.pair} ${worst.direction} ${wp>=0?"+":""}${wp.toFixed(2)}%`); }
 
     if (closed.length) {
-      lines.push("", "━━━━━━━━━━━━━━━━━━", "📋 *CLOSED TRADE DETAILS*");
-
-      closed.forEach((x, i) => {
-        const o = reportDateTime(x.created_at);
-        const c = reportDateTime(x.closed_at);
-        const rpStored = Number(x.realized_profit_pct || 0);
-        const hp = Number(x.highest_profit_pct || 0);
-        const rp = reportProfitFor(x);
-        const hitTargets = formatHitTargets(x);
-        const reason = x.close_reason || "Unknown";
-
+      lines.push("", "━━━━━━━━━━━━━━━━━━", "CLOSED TRADE DETAILS");
+      closed.forEach((x,i) => {
+        const o = reportDateTime(x.created_at), c = reportDateTime(x.closed_at);
+        const rpStored = Number(x.realized_profit_pct || 0), hp = Number(x.highest_profit_pct || 0);
+        const rp = String(x.close_reason || "").toLowerCase() === "direct sl" ? rpStored : Math.max(rpStored, hp);
         lines.push(
-          "",
-          `*${i + 1}. ${String(x.pair || x.symbol)} — ${x.direction}*`,
-          "",
-          `📅 Opened: ${o.date}`,
-          `⏰ Time: ${o.time}`,
-          `💰 Entry: ${reportFmt(x.entry_mid)}`,
-          `🛑 SL: ${reportFmt(x.sl_price)}`,
-          `🎯 TP1: ${reportFmt(x.tp1_price)}`,
-          `🎯 TP2: ${reportFmt(x.tp2_price)}`,
-          `🎯 TP3: ${reportFmt(x.tp3_price)}`,
-          `✅ Targets Hit: ${hitTargets}`,
-          `🏆 Highest Profit: ${hp >= 0 ? "+" : ""}${hp.toFixed(2)}%`,
-          `📍 Close Price: ${reportFmt(x.close_price)}`,
-          `📊 Final Reported P/L (10X): ${rp >= 0 ? "+" : ""}${rp.toFixed(2)}%`,
-          `🔒 Close Reason: ${reason}`,
-          `📅 Closed: ${c.date}`,
-          `⏰ Close Time: ${c.time}`
+          "", `${i+1}. ${String(x.pair || x.symbol)} — ${x.direction}`,
+          `Open: ${o.date} ${o.time} | ${reportFmt(x.entry_mid)}`,
+          `SL: ${reportFmt(x.sl_price)} | TP1: ${reportFmt(x.tp1_price)} | TP2: ${reportFmt(x.tp2_price)} | TP3: ${reportFmt(x.tp3_price)}`,
+          `TP: ${Number(x.tp1_hit)?"✅":"❌"} ${Number(x.tp2_hit)?"✅":"❌"} ${Number(x.tp3_hit)?"✅":"❌"}`,
+          `Best Move: +${hp.toFixed(2)}%`,
+          `Close: ${c.date} ${c.time} | ${reportFmt(x.close_price)}`,
+          `Realized P/L: ${rp>=0?"+":""}${rp.toFixed(2)}%`,
+          `Reason: ${x.close_reason || "Unknown"}`
         );
-
-        // Keep the stored direct-SL result visible for auditability without changing the main P/L rule.
-        if (String(reason).toLowerCase() === "direct sl") {
-          lines.push(`📉 SL Move (10X): ${rpStored >= 0 ? "+" : ""}${rpStored.toFixed(2)}%`);
-        }
-
-        if (i < closed.length - 1) lines.push("", "──────────────────");
       });
     } else {
-      lines.push("", "━━━━━━━━━━━━━━━━━━", "No closed trades in this period.");
+      lines.push("", "No closed trades in this period.");
     }
-
     await sendTelegramChunked(env, chatId, lines.join("\n"));
   } catch (error) {
     console.error("TRADE REPORT ERROR", period, error);
@@ -3420,14 +3315,29 @@ async function saveMessage(env, telegramId, role, content) {
       INSERT INTO messages (telegram_id,role,content,created_at)
       VALUES (?, ?, ?, datetime('now'))
     `).bind(telegramId, role, content).run();
+
+    // Do not issue a DELETE on every message. That was an unnecessary D1 row
+    // write multiplier and contributed to the free-tier write limit. Keep the
+    // history bounded only when it has grown materially beyond the working
+    // window; normal reads already request MAX_HISTORY rows.
     try {
-      await env.DB.prepare(`
-        DELETE FROM messages
-        WHERE telegram_id = ?
-          AND id NOT IN (
-            SELECT id FROM messages WHERE telegram_id = ? ORDER BY id DESC LIMIT ?
-          )
-      `).bind(telegramId, telegramId, DEFAULTS.MAX_HISTORY).run();
+      const countRow = await env.DB.prepare(
+        "SELECT COUNT(*) AS c FROM messages WHERE telegram_id = ?"
+      ).bind(telegramId).first();
+      const count = Number(countRow && countRow.c || 0);
+      const trimAt = Number(DEFAULTS.MAX_HISTORY) + 75;
+      if (count > trimAt) {
+        await env.DB.prepare(`
+          DELETE FROM messages
+          WHERE telegram_id = ?
+            AND id NOT IN (
+              SELECT id FROM messages
+              WHERE telegram_id = ?
+              ORDER BY id DESC
+              LIMIT ?
+            )
+        `).bind(telegramId, telegramId, DEFAULTS.MAX_HISTORY).run();
+      }
     } catch (error) {
       if (!blockD1Writes(error, "messageTrim")) console.error("MESSAGE TRIM ERROR", error);
     }
@@ -3473,40 +3383,6 @@ async function setMeta(env, key, value) {
 /* ============================================================
    SCHEDULED JOBS
 ============================================================ */
-
-async function claimNewsFingerprint(env, key, ttlMs) {
-  if (!env.OKX_MONITOR || !key) return false;
-  try {
-    const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
-    const stub = env.OKX_MONITOR.get(id);
-    const response = await stub.fetch("https://okx-monitor/news-claim", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key: String(key), ttlMs: Number(ttlMs) || 6 * 60 * 60 * 1000 })
-    });
-    if (!response.ok) return false;
-    const data = await response.json();
-    return !!(data && data.claimed);
-  } catch (error) {
-    console.error("NEWS DEDUP CLAIM ERROR", error);
-    // If the dedup store is unavailable, do not publish. This is safer than
-    // risking a duplicate blast every 5-minute cron tick.
-    return false;
-  }
-}
-
-async function releaseNewsFingerprint(env, key) {
-  if (!env.OKX_MONITOR || !key) return;
-  try {
-    const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
-    const stub = env.OKX_MONITOR.get(id);
-    await stub.fetch("https://okx-monitor/news-release", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key: String(key) })
-    });
-  } catch (_) {}
-}
 
 async function syncOkxMonitorDurableObject(env) {
   if (!env.OKX_MONITOR || !env.DB) return;
@@ -3593,11 +3469,10 @@ export class OkxMonitorDO extends DurableObject {
     // live updates repeatedly while a candle is forming. Monitoring/TP/SL
     // calculations stay real-time in memory; D1 is only persisted periodically.
     this.lastPersistAt = new Map();
-    this.persistIntervalMs = 5 * 60 * 1000;
+    this.persistIntervalMs = 30 * 1000;
     // TP notifications must remain idempotent even if D1 is unavailable or
     // the Durable Object is restarted. These keys live in DO storage, not D1.
     this.tpNotificationKeys = new Set();
-    this.tpNotificationInFlight = new Set();
     this.tpNotificationReady = this.state.storage.list({ prefix: "tpnotify:" }).then(entries => {
       for (const key of entries.keys()) this.tpNotificationKeys.add(key);
     }).catch(() => {});
@@ -3632,32 +3507,6 @@ export class OkxMonitorDO extends DurableObject {
         tickers: this.tickerCache.size,
         lastSyncAt: this.lastSyncAt
       }), { headers: { "Content-Type": "application/json" } });
-    }
-    if (url.pathname === "/news-claim" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const key = "newsdedup:" + String(body && body.key || "");
-        if (key === "newsdedup:") return jsonResponse({ claimed: false }, 400);
-        const ttlMs = Math.max(60 * 1000, Number(body.ttlMs) || 6 * 60 * 60 * 1000);
-        const existing = await this.state.storage.get(key);
-        const nowMs = Date.now();
-        if (existing && Number(existing) > nowMs) {
-          return jsonResponse({ claimed: false });
-        }
-        await this.state.storage.put(key, nowMs + ttlMs);
-        return jsonResponse({ claimed: true });
-      } catch (error) {
-        console.error("NEWS DEDUP CLAIM HANDLER ERROR", error);
-        return jsonResponse({ claimed: false }, 500);
-      }
-    }
-    if (url.pathname === "/news-release" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const key = "newsdedup:" + String(body && body.key || "");
-        if (key !== "newsdedup:") await this.state.storage.delete(key);
-      } catch (_) {}
-      return new Response("OK");
     }
     return new Response("OK");
   }
@@ -4010,99 +3859,188 @@ export class OkxMonitorDO extends DurableObject {
   async processCandle(symbol, candle) {
     const pos = this.positions.get(symbol);
     if (!pos || String(pos.status) !== "OPEN") return;
-    const high = Number(candle[2]), low = Number(candle[3]);
+
+    const high = Number(candle[2]);
+    const low = Number(candle[3]);
     if (!(high > 0) || !(low > 0)) return;
+
     pos.highest_price = Math.max(Number(pos.highest_price || pos.entry_mid), high);
     pos.lowest_price = Math.min(Number(pos.lowest_price || pos.entry_mid), low);
 
-    const newlyReached = [];
-    const checks = [["TP1","tp1_hit",Number(pos.tp1_price)],["TP2","tp2_hit",Number(pos.tp2_price)],["TP3","tp3_hit",Number(pos.tp3_price)]];
+    // Target notifications are deliberately committed to D1 only AFTER the
+    // Telegram reply succeeds. A Durable Object storage key prevents the same
+    // target from being sent twice across restarts, even if D1 is temporarily
+    // unavailable.
+    await this.tpNotificationReady;
+
+    const checks = [
+      ["TP1", "tp1_hit", Number(pos.tp1_price)],
+      ["TP2", "tp2_hit", Number(pos.tp2_price)],
+      ["TP3", "tp3_hit", Number(pos.tp3_price)]
+    ];
+
     for (const [name, field, target] of checks) {
       if (Number(pos[field] || 0)) continue;
-      const hit = pos.direction === "LONG" ? Number(pos.highest_price) >= target : Number(pos.lowest_price) <= target;
+
+      const hit = pos.direction === "LONG"
+        ? Number(pos.highest_price) >= target
+        : Number(pos.lowest_price) <= target;
       if (!hit) continue;
-      if (isD1WriteBlocked()) {
+
+      const notifyKey = `tpnotify:${Number(pos.id)}:${name}`;
+      if (this.tpNotificationKeys.has(notifyKey)) {
+        // A previous Telegram send succeeded but D1 persistence may have been
+        // interrupted. Keep the in-memory state consistent without sending again.
         pos[field] = 1;
-        newlyReached.push({name,price:target});
         continue;
       }
-      try {
-        const r = await this.env.DB.prepare(`UPDATE signal_positions SET ${field}=1,highest_price=?,lowest_price=?,updated_at=datetime('now') WHERE id=? AND status='OPEN' AND ${field}=0`).bind(Number(pos.highest_price),Number(pos.lowest_price),Number(pos.id)).run();
-        if (Number(r?.meta?.changes || 0) === 1) {
-          pos[field]=1;
-          newlyReached.push({name,price:target});
-        }
-      } catch (e) {
-        if (blockD1Writes(e, "okxTpClaim")) {
-          pos[field] = 1;
-          newlyReached.push({name,price:target});
-        } else {
-          console.error("OKX TP CLAIM ERROR", symbol, name, e);
-        }
-      }
-    }
-    for (const hit of newlyReached) {
-      // A TP notification is a one-time event per signal/target. This remains
-      // true across D1 quota outages and Durable Object restarts.
-      await this.tpNotificationReady;
-      const notifyKey = `tpnotify:${Number(pos.id)}:${hit.name}`;
-      if (this.tpNotificationKeys.has(notifyKey) || this.tpNotificationInFlight.has(notifyKey)) continue;
-      this.tpNotificationInFlight.add(notifyKey);
-      try { await this.state.storage.put(notifyKey, Date.now()); } catch (_) {}
-      this.tpNotificationKeys.add(notifyKey);
 
-      const pct = Math.abs((Number(hit.price)-Number(pos.entry_mid))/Number(pos.entry_mid))*1000;
-      const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*"+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
-      try {
-        if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
-      } finally {
-        this.tpNotificationInFlight.delete(notifyKey);
+      const pct = Math.abs((target - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000;
+      const msg =
+        "🎯 *" + name + " HIT*\n\n" +
+        "📌 " + pos.pair + " — " + pos.direction + "\n" +
+        "💰 Price: `" + reportFmt(target) + "`\n" +
+        "📈 Profit: *+" + pct.toFixed(1) + "%*" +
+        (name === "TP1" ? "\n\n⚠️ SL is now protected at entry." : "");
+
+      if (!pos.channel_message_id) continue;
+
+      const sent = await sendTelegramReply(this.env, msg, pos.channel_message_id);
+      if (!sent) {
+        // Do not mark the target as completed. The next candle/update can retry.
+        console.warn("OKX TP TELEGRAM RETRY", symbol, name);
+        continue;
+      }
+
+      // Telegram succeeded: persist the target completion now.
+      let persisted = false;
+      if (!isD1WriteBlocked()) {
+        try {
+          const r = await this.env.DB.prepare(`
+            UPDATE signal_positions
+            SET ${field}=1,
+                highest_price=?,
+                lowest_price=?,
+                updated_at=datetime('now')
+            WHERE id=? AND status='OPEN' AND ${field}=0
+          `).bind(
+            Number(pos.highest_price),
+            Number(pos.lowest_price),
+            Number(pos.id)
+          ).run();
+          persisted = Number(r?.meta?.changes || 0) === 1;
+        } catch (e) {
+          if (!blockD1Writes(e, "okxTpPersist")) {
+            console.error("OKX TP PERSIST ERROR", symbol, name, e);
+          }
+        }
+      }
+
+      // Store the idempotency marker after the Telegram send, regardless of a
+      // temporary D1 failure. This avoids duplicate Telegram replies on restart.
+      this.tpNotificationKeys.add(notifyKey);
+      try { await this.state.storage.put(notifyKey, Date.now()); } catch (_) {}
+      pos[field] = 1;
+
+      if (!persisted) {
+        console.warn("OKX TP D1 PERSIST DEFERRED", symbol, name);
       }
     }
+
     await this.persistPosition(pos);
 
-    const anyTp = Number(pos.tp1_hit)||Number(pos.tp2_hit)||Number(pos.tp3_hit);
+    const anyTp = Number(pos.tp1_hit) || Number(pos.tp2_hit) || Number(pos.tp3_hit);
     let effectiveStop = Number(pos.sl_price);
     if (Number(pos.tp1_hit)) effectiveStop = Number(pos.entry_mid);
     if (Number(pos.tp3_hit)) {
-      const entry=Number(pos.entry_mid);
-      effectiveStop = pos.direction === "LONG" ? entry + Math.max(0,Number(pos.highest_price)-entry)*0.80 : entry - Math.max(0,entry-Number(pos.lowest_price))*0.80;
+      const entry = Number(pos.entry_mid);
+      effectiveStop = pos.direction === "LONG"
+        ? entry + Math.max(0, Number(pos.highest_price) - entry) * 0.80
+        : entry - Math.max(0, entry - Number(pos.lowest_price)) * 0.80;
     }
-    const stopHit = pos.direction === "LONG" ? low <= effectiveStop : high >= effectiveStop;
-    if (!stopHit || newlyReached.some(x=>x.name==="TP3")) return;
 
-    const closePrice = pos.direction === "LONG" ? (low <= effectiveStop ? effectiveStop : high) : (high >= effectiveStop ? effectiveStop : low);
-    const realizedAtClose = reportMovePct(pos.direction,pos.entry_mid,closePrice);
-    const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
-    const peakPct = Math.max(0,reportMovePct(pos.direction,pos.entry_mid,peak)||0);
-    const reportProfit = anyTp ? peakPct : realizedAtClose;
-    const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
+    const stopHit = pos.direction === "LONG"
+      ? low <= effectiveStop
+      : high >= effectiveStop;
+    if (!stopHit) return;
+
+    // Never close on the same candle/update that just completed TP3. Continue
+    // monitoring so the profit-protection logic can observe a meaningful pullback.
+    const tp3Target = Number(pos.tp3_price);
+    const tp3JustHit = checks.some(([name, field, target]) =>
+      name === "TP3" && Number(pos[field] || 0) === 1 &&
+      ((pos.direction === "LONG" && high >= target) || (pos.direction === "SHORT" && low <= target))
+    );
+    if (tp3JustHit) return;
+
     if (isD1WriteBlocked()) {
       console.warn("OKX MONITOR CLOSE D1 BLOCK", symbol);
       return;
     }
-    const claim=await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(Number(pos.id)).run();
-    if (Number(claim?.meta?.changes||0)!==1) return;
-    pos.status="CLOSING"; this.positions.delete(symbol); await this.reconcileSubscriptions(false);
-    const hitTargets = formatHitTargets(pos);
+
+    const closeClaim = await this.env.DB.prepare(
+      "UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'"
+    ).bind(Number(pos.id)).run();
+    if (Number(closeClaim?.meta?.changes || 0) !== 1) return;
+
+    pos.status = "CLOSING";
+    this.positions.delete(symbol);
+    await this.reconcileSubscriptions(false);
+
+    const closePrice = pos.direction === "LONG" ? effectiveStop : effectiveStop;
+    const realizedAtClose = reportMovePct(pos.direction, pos.entry_mid, closePrice);
+    const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
+    const peakPct = Math.max(0, reportMovePct(pos.direction, pos.entry_mid, peak) || 0);
+    const highestProfit = Math.max(0, peakPct);
+    const reason = anyTp ? "Protection exit" : "Risk exit";
+
     const msg = anyTp
-      ? "🔒 *SIGNAL CLOSED*\n\n"+
-        "📌 "+pos.pair+" — "+pos.direction+"\n\n"+
-        "💰 Closed Price: `"+reportFmt(closePrice)+"`\n"+
-        "📊 Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
-        "🏆 Highest Favorable Price: `"+reportFmt(peak)+"`\n"+
-        "🏆 Highest Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
-        "🎯 Targets Hit: *"+hitTargets+"*\n\n"+
-        "🔒 Position Closed"
-      : "😔 *SL HIT*\n\n"+
-        "📌 "+pos.pair+" — "+pos.direction+"\n\n"+
-        "💰 SL Price: `"+reportFmt(closePrice)+"`\n"+
-        "📉 Loss: *"+(realizedAtClose>=0?"+":"")+realizedAtClose.toFixed(1)+"%*\n\n"+
-        "🔒 Position Closed";
-    try { if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id); }
-    finally {
-      await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSED',closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(closePrice,reportProfit,peakPct,reason,Number(pos.id)).run();
+      ? "🔒 *PROTECTION EXIT*\n\n" +
+        "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
+        "💰 Exit Price: `" + reportFmt(closePrice) + "`\n" +
+        "🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n" +
+        "🏆 Highest Leveraged Profit: *+" + highestProfit.toFixed(1) + "%*\n\n" +
+        "🎯 TP1 " + (Number(pos.tp1_hit) ? "✅" : "❌") +
+        "   TP2 " + (Number(pos.tp2_hit) ? "✅" : "❌") +
+        "   TP3 " + (Number(pos.tp3_hit) ? "✅" : "❌") + "\n\n" +
+        "Price pulled back from the highest achieved level after a target was completed."
+      : "🛡️ *RISK EXIT*\n\n" +
+        "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
+        "💰 Exit Price: `" + reportFmt(closePrice) + "`\n" +
+        "📌 Hard risk level reached before any target was completed.";
+
+    const closeSent = pos.channel_message_id
+      ? await sendTelegramReply(this.env, msg, pos.channel_message_id)
+      : false;
+
+    if (!closeSent) {
+      // Do not permanently close a position when the required Telegram reply
+      // could not be delivered. Put it back into the live monitor so the next
+      // candle can retry the close notification.
+      pos.status = "OPEN";
+      this.positions.set(symbol, pos);
+      await this.reconcileSubscriptions(false);
+      console.warn("OKX CLOSE TELEGRAM RETRY", symbol);
+      return;
     }
+
+    await this.env.DB.prepare(`
+      UPDATE signal_positions
+      SET status='CLOSED',
+          closed_at=datetime('now'),
+          close_price=?,
+          realized_profit_pct=?,
+          highest_profit_pct=?,
+          close_reason=?,
+          updated_at=datetime('now')
+      WHERE id=? AND status='CLOSING'
+    `).bind(
+      closePrice,
+      anyTp ? highestProfit : Math.max(0, Number(realizedAtClose) || 0),
+      highestProfit,
+      reason,
+      Number(pos.id)
+    ).run();
   }
 
   async persistPosition(pos, force = false) {
@@ -4148,7 +4086,6 @@ export class OkxMonitorDO extends DurableObject {
       await this.persistPosition(pos, true);
     }
   }
-  */
 }
 
 /* ============================================================
