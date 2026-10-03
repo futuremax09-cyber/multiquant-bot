@@ -2353,8 +2353,14 @@ async function monitorOpenSignals(env, tickers) {
 
       for (const hit of newlyReached) {
         const pct = Math.abs((Number(hit.price) - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000;
-        const hitTime = reportDateTime(new Date().toISOString());
-        const msg = "😊 *" + hit.name + " HIT* ✅\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n⏰ Hit Time: `" + hitTime.date + " " + hitTime.time + "`\n💰 Price: `" + reportFmt(hit.price) + "`\n📈 Profit: *+" + pct.toFixed(1) + "%*" + (hit.name === "TP1" ? "\n\n⚠️ SL is now protected at entry." : "");
+        const hitAt = reportNow();
+        const nextTarget = hit.name === "TP1" ? "TP2" : (hit.name === "TP2" ? "TP3" : null);
+        const msg = "😊 *" + hit.name + " HIT* ✅\n\n" +
+          "📌 *" + pos.pair + " — " + pos.direction + "*\n" +
+          "🎯 *Entry:* `" + reportFmt(pos.entry_mid) + "`\n" +
+          "💰 *Price:* `" + reportFmt(hit.price) + "`\n" +
+          "📈 *Profit:* *+" + pct.toFixed(1) + "%*" +
+          (nextTarget ? "\n\n🎯 *" + nextTarget + " Coming Soon...*" : "\n\n🏆 *Profit Protection Active*");
         if (pos.channel_message_id) await sendTelegramReply(env, msg, pos.channel_message_id);
       }
 
@@ -2385,16 +2391,33 @@ async function monitorOpenSignals(env, tickers) {
       // Once any TP has been reached, the reported trade profit is the best
       // favorable move achieved by the position. Direct SL remains the actual
       // negative move at the SL price.
-      const reportProfit = anyTp ? peakPct : realizedAtClose;
-      const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
+      const favorableMoveSeen = peakPct > 0.05;
+      const protectionExit = anyTp || favorableMoveSeen;
+      const reportProfit = protectionExit ? peakPct : realizedAtClose;
+      const reason = protectionExit ? "Trailing/Reversal" : "Direct SL";
       const closeClaim = await env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(pos.id).run();
       if (Number(closeClaim?.meta?.changes || 0) !== 1) continue;
 
-      const hitTargetsText = [tp1Hit ? "TP1 ✅" : "", tp2Hit ? "TP2 ✅" : "", tp3Hit ? "TP3 ✅" : ""].filter(Boolean).join("   ") || "None";
-      const closeTime = reportDateTime(new Date().toISOString());
-      const msg = anyTp
-        ? "🔒 *SIGNAL CLOSED*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n⏰ Exit Time: `" + closeTime.date + " " + closeTime.time + "`\n💰 Closed Price: `" + reportFmt(closePrice) + "`\n📊 Profit: *+" + peakPct.toFixed(1) + "%*\n\n🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n🏆 Highest Profit: *+" + peakPct.toFixed(1) + "%*\n\n🎯 Targets Hit: " + hitTargetsText
-        : "🛡️ *RISK EXIT*\n\n📌 " + pos.pair + " — " + pos.direction + "\n\n⏰ SL Hit Time: `" + closeTime.date + " " + closeTime.time + "`\n🛑 SL Price: `" + reportFmt(closePrice) + "`\n\n🔒 Position closed at the defined risk level.";
+      const closeAt = reportNow();
+      const hitTargets = [];
+      if (tp1Hit) hitTargets.push("TP1 ✅");
+      if (tp2Hit) hitTargets.push("TP2 ✅");
+      if (tp3Hit) hitTargets.push("TP3 ✅");
+      const msg = protectionExit
+        ? "😊 *SIGNAL CLOSED* ✅\n\n" +
+          "📌 *" + pos.pair + " — " + pos.direction + "*\n" +
+          "🎯 *Entry:* `" + reportFmt(pos.entry_mid) + "`\n" +
+          "💰 *Closed Price:* `" + reportFmt(closePrice) + "`\n" +
+          "🏆 *Best Price:* `" + reportFmt(peak) + "`\n" +
+          "📈 *Best Profit:* *+" + peakPct.toFixed(1) + "%*\n\n" +
+          "🎯 *Targets Hit:* " + (hitTargets.length ? hitTargets.join("   ") : "None") + "\n\n" +
+          "🔒 *Profit Protected*"
+        : "😔 *SL HIT* ❌\n\n" +
+          "📌 *" + pos.pair + " — " + pos.direction + "*\n" +
+          "🎯 *Entry:* `" + reportFmt(pos.entry_mid) + "`\n" +
+          "🛑 *SL Price:* `" + reportFmt(closePrice) + "`\n" +
+          "📉 *Loss:* *" + realizedAtClose.toFixed(1) + "%*\n\n" +
+          "🔒 *Signal Closed*";
       try {
         if (pos.channel_message_id) await sendTelegramReply(env, msg, pos.channel_message_id);
       } finally {
@@ -2879,13 +2902,17 @@ function reportDateTime(value) {
   return { date: `${parts.day}-${parts.month}-${parts.year}`, time: `${parts.hour}:${parts.minute}:${parts.second}` };
 }
 
+function reportNow() {
+  return reportDateTime(new Date().toISOString());
+}
+
 async function handlePositionsCommand(chatId, env) {
   if (!env.DB) return await sendTelegram(env, chatId, "❌ D1 database is not available.");
   try {
     await ensureSchema(env);
     const result = await env.DB.prepare(`SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 50`).all();
     const positions = result?.results || [];
-    if (!positions.length) return await sendTelegram(env, chatId, "📊 LIVE OPEN POSITIONS\n\nNo open positions.");
+    if (!positions.length) return await sendTelegram(env, chatId, "📊 *LIVE OPEN POSITIONS*\n\nNo open positions.");
 
     let tickers = null;
     try { tickers = await getOkxTickers(env); } catch (error) { console.error("POSITIONS TICKER SNAPSHOT ERROR", error); }
@@ -2897,22 +2924,27 @@ async function handlePositionsCommand(chatId, env) {
       const opened = reportDateTime(pos.created_at);
       const peak = pos.direction === "LONG" ? pos.highest_price : pos.lowest_price;
       const peakMove = reportMovePct(pos.direction, pos.entry_mid, peak);
+      const hitTargets = [];
+      if (Number(pos.tp1_hit)) hitTargets.push("TP1 ✅");
+      if (Number(pos.tp2_hit)) hitTargets.push("TP2 ✅");
+      if (Number(pos.tp3_hit)) hitTargets.push("TP3 ✅");
       return {
         index: i + 1,
         move,
         block: [
-          `${i + 1}. ${String(pos.pair || pos.symbol).replace(/[_*`]/g, "")} — ${pos.direction}`,
-          `📅 Open Date: ${opened.date}`,
-          `⏰ Open Time: ${opened.time}`,
-          `💰 Open Price: ${reportFmt(pos.entry_mid)}`,
-          `📍 Current Price: ${reportFmt(current)}`,
-          `📈 Current P/L: ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
-          `🎯 TP1: ${reportFmt(pos.tp1_price)}`,
-          `🎯 TP2: ${reportFmt(pos.tp2_price)}`,
-          `🎯 TP3: ${reportFmt(pos.tp3_price)}`,
-          `🛑 SL: ${reportFmt(pos.sl_price)}`,
-          `🎯 Targets Hit: ${[Number(pos.tp1_hit) ? "TP1 ✅" : "", Number(pos.tp2_hit) ? "TP2 ✅" : "", Number(pos.tp3_hit) ? "TP3 ✅" : ""].filter(Boolean).join("   ") || "None"}`,
-          `🏆 Best Move: ${peakMove === null ? "N/A" : (peakMove >= 0 ? "+" : "") + peakMove.toFixed(2) + "%"}`
+          `*${i + 1}. ${String(pos.pair || pos.symbol).replace(/[*_`]/g, "")} — ${pos.direction}*`,
+          `📅 *Open Date:* ${opened.date}`,
+          `⏰ *Open Time:* ${opened.time}`,
+          `💰 *Entry Price:* \`${reportFmt(pos.entry_mid)}\``,
+          `📍 *Current Price:* \`${reportFmt(current)}\``,
+          `📈 *Current P/L:* ${move === null ? "N/A" : (move >= 0 ? "+" : "") + move.toFixed(2) + "%"}`,
+          `🎯 *TP1:* \`${reportFmt(pos.tp1_price)}\``,
+          `🎯 *TP2:* \`${reportFmt(pos.tp2_price)}\``,
+          `🎯 *TP3:* \`${reportFmt(pos.tp3_price)}\``,
+          `🛑 *SL:* \`${reportFmt(pos.sl_price)}\``,
+          `🎯 *Targets Hit:* ${hitTargets.length ? hitTargets.join("   ") : "None"}`,
+          `🏆 *Best Move:* ${peakMove === null ? "N/A" : (peakMove >= 0 ? "+" : "") + peakMove.toFixed(2) + "%"}`,
+          `━━━━━━━━━━━━━━━━━━`
         ].join("\n")
       };
     });
@@ -2928,24 +2960,22 @@ async function handlePositionsCommand(chatId, env) {
     const tp3 = positions.filter(x => Number(x.tp3_hit)).length;
 
     const summary = [
-      "📊 LIVE OPEN POSITIONS",
-      "",
-      `Open Positions: ${positions.length}`,
-      `🟢 Profitable: ${profitable}`,
-      `🔴 Losing: ${losing}`,
-      `⚪ Flat: ${flat}`,
-      `📈 Current Net P/L: ${currentNet >= 0 ? "+" : ""}${currentNet.toFixed(2)}%`,
-      `🎯 TP1 Hits: ${tp1}   TP2 Hits: ${tp2}   TP3 Hits: ${tp3}`,
-      best ? `🏆 Best Current: #${best.index} ${best.move >= 0 ? "+" : ""}${best.move.toFixed(2)}%` : "🏆 Best Current: N/A",
-      worst ? `📉 Worst Current: #${worst.index} ${worst.move >= 0 ? "+" : ""}${worst.move.toFixed(2)}%` : "📉 Worst Current: N/A"
+      "📊 *LIVE OPEN POSITIONS*",
+      "━━━━━━━━━━━━━━━━━━",
+      `📌 *Total Open:* ${positions.length}`,
+      `🟢 *Profitable:* ${profitable}    🔴 *Losing:* ${losing}    ⚪ *Flat:* ${flat}`,
+      `📈 *Current Net P/L:* ${currentNet >= 0 ? "+" : ""}${currentNet.toFixed(2)}%`,
+      `🎯 *TP1 Hits:* ${tp1}    *TP2 Hits:* ${tp2}    *TP3 Hits:* ${tp3}`,
+      best ? `🏆 *Best Current:* #${best.index} ${best.move >= 0 ? "+" : ""}${best.move.toFixed(2)}%` : "🏆 *Best Current:* N/A",
+      worst ? `📉 *Worst Current:* #${worst.index} ${worst.move >= 0 ? "+" : ""}${worst.move.toFixed(2)}%` : "📉 *Worst Current:* N/A",
+      "━━━━━━━━━━━━━━━━━━"
     ].join("\n");
 
-    // Keep every position intact. Never split a signal block across Telegram messages.
     const MAX = 3800;
     const pages = [];
     let page = "";
     for (const row of rows) {
-      const candidate = page ? page + "\n\n" + row.block : row.block;
+      const candidate = page ? page + "\n" + row.block : row.block;
       if (candidate.length > MAX && page) {
         pages.push(page);
         page = row.block;
@@ -2957,11 +2987,11 @@ async function handlePositionsCommand(chatId, env) {
 
     for (let i = 0; i < pages.length; i++) {
       const header = i === 0
-        ? summary + `\n\n━━━━━━━━━━━━━━━━━━\n📋 SIGNALS — PAGE ${i + 1}/${pages.length}`
-        : `📊 LIVE OPEN POSITIONS\n\n📋 SIGNALS — PAGE ${i + 1}/${pages.length}`;
-      await sendTelegram(env, chatId, header + "\n\n" + pages[i]);
+        ? summary + `\n📋 *SIGNALS — PAGE ${i + 1}/${pages.length}*\n`
+        : `📊 *LIVE OPEN POSITIONS*\n📋 *SIGNALS — PAGE ${i + 1}/${pages.length}*\n`;
+      await sendTelegram(env, chatId, header + "\n" + pages[i]);
     }
-    await sendTelegram(env, chatId, "\n⚠️ P/L is signal price-move × 10 convention, not broker/account P&L.");
+    await sendTelegram(env, chatId, "_P/L shown is signal price-move × 10 convention, not broker/account P&L._");
   } catch (error) {
     console.error("POSITIONS COMMAND ERROR", error);
     await sendTelegram(env, chatId, "❌ /positions error. Check Worker logs.");
@@ -3818,12 +3848,12 @@ export class OkxMonitorDO extends DurableObject {
       const rows = result && result.results ? result.results : [];
       const next = new Map();
       for (const row of rows) {
-        // A close can be completed by the Durable Object while D1 is under
-        // its daily write circuit breaker. Do not resurrect such a position
-        // from the stale OPEN row while the deferred close is pending.
-        let locallyClosed = false;
-        try { locallyClosed = !!(await this.state.storage.get(`closed:${Number(row.id)}`)); } catch (_) {}
-        if (locallyClosed) continue;
+        // A close may have been executed by the Durable Object while D1 was
+        // temporarily unavailable. Keep the local closed marker authoritative
+        // so an old OPEN D1 row cannot resurrect the position on the next sync.
+        let closedMarker = null;
+        try { closedMarker = await this.state.storage.get(`closed:${Number(row.id)}`); } catch (_) {}
+        if (closedMarker && closedMarker.status === "CLOSED") continue;
 
         const existing = this.positions.get(row.symbol);
         next.set(row.symbol, {
@@ -3906,14 +3936,15 @@ export class OkxMonitorDO extends DurableObject {
       }
 
       const pct = Math.abs((target - Number(pos.entry_mid)) / Number(pos.entry_mid)) * 1000;
-      const hitTime = reportDateTime(new Date().toISOString());
+      const hitAt = reportNow();
+      const nextTarget = name === "TP1" ? "TP2" : (name === "TP2" ? "TP3" : null);
       const msg =
         "😊 *" + name + " HIT* ✅\n\n" +
-        "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
-        "⏰ Hit Time: `" + hitTime.date + " " + hitTime.time + "`\n" +
-        "💰 Price: `" + reportFmt(target) + "`\n" +
-        "📈 Profit: *+" + pct.toFixed(1) + "%*" +
-        (name === "TP1" ? "\n\n⚠️ SL is now protected at entry." : "");
+        "📌 *" + pos.pair + " — " + pos.direction + "*\n" +
+        "🎯 *Entry:* `" + reportFmt(pos.entry_mid) + "`\n" +
+        "💰 *Price:* `" + reportFmt(target) + "`\n" +
+        "📈 *Profit:* *+" + pct.toFixed(1) + "%*" +
+        (nextTarget ? "\n\n🎯 *" + nextTarget + " Coming Soon...*" : "\n\n🏆 *Profit Protection Active*");
 
       if (!pos.channel_message_id) continue;
 
@@ -3985,76 +4016,74 @@ export class OkxMonitorDO extends DurableObject {
     );
     if (tp3JustHit) return;
 
-    // Closing must never be blocked by the D1 daily write circuit breaker.
-    // The Durable Object is authoritative for the live monitoring decision;
-    // D1 persistence is retried asynchronously if D1 is temporarily blocked.
-    const closeKey = `close-inflight:${Number(pos.id)}`;
-    let closeAlreadyClaimed = false;
-    try {
-      closeAlreadyClaimed = !!(await this.state.storage.get(closeKey));
-    } catch (_) {}
-    if (closeAlreadyClaimed) return;
-    try { await this.state.storage.put(closeKey, Date.now()); } catch (_) {}
+    // A D1 quota/circuit-breaker must never prevent the monitor from closing
+    // a position. Use the Durable Object as the execution/idempotency layer;
+    // D1 persistence is attempted afterwards when available.
+    let closeClaimed = true;
+    if (!isD1WriteBlocked()) {
+      try {
+        const closeClaim = await this.env.DB.prepare(
+          "UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'"
+        ).bind(Number(pos.id)).run();
+        closeClaimed = Number(closeClaim?.meta?.changes || 0) === 1;
+      } catch (e) {
+        closeClaimed = true;
+        if (!blockD1Writes(e, "okxCloseClaim")) console.error("OKX CLOSE CLAIM ERROR", symbol, e);
+      }
+    }
+    if (!closeClaimed) return;
+
+    pos.status = "CLOSING";
+    this.positions.delete(symbol);
+    await this.reconcileSubscriptions(false);
 
     const closePrice = effectiveStop;
     const realizedAtClose = reportMovePct(pos.direction, pos.entry_mid, closePrice);
     const peak = pos.direction === "LONG" ? Number(pos.highest_price) : Number(pos.lowest_price);
     const peakPct = Math.max(0, reportMovePct(pos.direction, pos.entry_mid, peak) || 0);
     const highestProfit = Math.max(0, peakPct);
-    const reason = anyTp ? "Protection exit" : "Risk exit";
-    const hitTargets = [
-      Number(pos.tp1_hit) ? "TP1 ✅" : "",
-      Number(pos.tp2_hit) ? "TP2 ✅" : "",
-      Number(pos.tp3_hit) ? "TP3 ✅" : ""
-    ].filter(Boolean).join("   ") || "None";
-    const exitTime = reportDateTime(new Date().toISOString());
+    const favorableMoveSeen = peakPct > 0.05;
+    const protectionExit = anyTp || favorableMoveSeen;
+    const reason = protectionExit ? "Protection exit" : "Risk exit";
+    const closeAt = reportNow();
+    const hitTargets = [];
+    if (Number(pos.tp1_hit)) hitTargets.push("TP1 ✅");
+    if (Number(pos.tp2_hit)) hitTargets.push("TP2 ✅");
+    if (Number(pos.tp3_hit)) hitTargets.push("TP3 ✅");
 
-    const msg = anyTp
-      ? "🔒 *PROTECTION EXIT*\n\n" +
-        "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
-        "⏰ Exit Time: `" + exitTime.date + " " + exitTime.time + "`\n" +
-        "💰 Exit Price: `" + reportFmt(closePrice) + "`\n" +
-        "🏆 Highest Favorable Price: `" + reportFmt(peak) + "`\n" +
-        "🏆 Highest Leveraged Profit: *+" + highestProfit.toFixed(1) + "%*\n\n" +
-        "🎯 Targets Hit: " + hitTargets + "\n\n" +
-        "🔒 Profit protected after a pullback from the highest achieved level."
-      : "🛡️ *RISK EXIT*\n\n" +
-        "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
-        "⏰ SL Hit Time: `" + exitTime.date + " " + exitTime.time + "`\n" +
-        "🛑 SL Price: `" + reportFmt(closePrice) + "`\n\n" +
-        "🔒 Position closed at the defined risk level.";
+    const msg = protectionExit
+      ? "😊 *SIGNAL CLOSED* ✅\n\n" +
+        "📌 *" + pos.pair + " — " + pos.direction + "*\n" +
+        "🎯 *Entry:* `" + reportFmt(pos.entry_mid) + "`\n" +
+        "💰 *Closed Price:* `" + reportFmt(closePrice) + "`\n" +
+        "🏆 *Best Price:* `" + reportFmt(peak) + "`\n" +
+        "📈 *Best Profit:* *+" + highestProfit.toFixed(1) + "%*\n\n" +
+        "🎯 *Targets Hit:* " + (hitTargets.length ? hitTargets.join("   ") : "None") + "\n\n" +
+        "🔒 *Profit Protected*"
+      : "😔 *SL HIT* ❌\n\n" +
+        "📌 *" + pos.pair + " — " + pos.direction + "*\n" +
+        "🎯 *Entry:* `" + reportFmt(pos.entry_mid) + "`\n" +
+        "🛑 *SL Price:* `" + reportFmt(closePrice) + "`\n" +
+        "📉 *Loss:* *" + realizedAtClose.toFixed(1) + "%*\n\n" +
+        "🔒 *Signal Closed*";
 
     const closeSent = pos.channel_message_id
       ? await sendTelegramReply(this.env, msg, pos.channel_message_id)
       : false;
 
     if (!closeSent) {
-      try { await this.state.storage.delete(closeKey); } catch (_) {}
+      // Do not permanently close a position when the required Telegram reply
+      // could not be delivered. Put it back into the live monitor so the next
+      // candle can retry the close notification.
+      pos.status = "OPEN";
+      this.positions.set(symbol, pos);
+      await this.reconcileSubscriptions(false);
       console.warn("OKX CLOSE TELEGRAM RETRY", symbol);
       return;
     }
 
-    const closedRecord = {
-      id: Number(pos.id),
-      symbol: pos.symbol,
-      closePrice,
-      realizedProfitPct: anyTp ? highestProfit : Math.max(0, Number(realizedAtClose) || 0),
-      highestProfitPct: highestProfit,
-      reason,
-      closedAt: new Date().toISOString()
-    };
-
-    // Persist a DO-local close marker BEFORE touching D1. If D1 is exhausted,
-    // syncPositions() will not resurrect this stale OPEN row after a restart.
-    try { await this.state.storage.put(`closed:${Number(pos.id)}`, closedRecord); } catch (_) {}
-    try { await this.state.storage.delete(closeKey); } catch (_) {}
-
-    pos.status = "CLOSED";
-    this.positions.delete(symbol);
-    await this.reconcileSubscriptions(false);
-
-    if (!isD1WriteBlocked()) {
-      try {
+    try {
+      if (!isD1WriteBlocked()) {
         await this.env.DB.prepare(`
           UPDATE signal_positions
           SET status='CLOSED',
@@ -4064,23 +4093,30 @@ export class OkxMonitorDO extends DurableObject {
               highest_profit_pct=?,
               close_reason=?,
               updated_at=datetime('now')
-          WHERE id=? AND status IN ('OPEN','CLOSING')
+          WHERE id=? AND status IN ('CLOSING','OPEN')
         `).bind(
-          closedRecord.closePrice,
-          closedRecord.realizedProfitPct,
-          closedRecord.highestProfitPct,
-          closedRecord.reason,
-          closedRecord.id
+          closePrice,
+          protectionExit ? highestProfit : Number(realizedAtClose) || 0,
+          highestProfit,
+          reason,
+          Number(pos.id)
         ).run();
-        try { await this.state.storage.delete(`closed:${closedRecord.id}`); } catch (_) {}
-      } catch (error) {
-        if (!blockD1Writes(error, "okxClosePersist")) {
-          console.error("OKX MONITOR CLOSE D1 PERSIST ERROR", symbol, error);
-        }
+      } else {
+        console.warn("OKX CLOSE D1 PERSIST DEFERRED", symbol);
       }
-    } else {
-      console.warn("OKX MONITOR CLOSE D1 DEFERRED", symbol);
+    } catch (e) {
+      if (!blockD1Writes(e, "okxClosePersist")) console.error("OKX CLOSE D1 PERSIST ERROR", symbol, e);
     }
+    try {
+      await this.state.storage.put(`closed:${Number(pos.id)}`, {
+        status: "CLOSED",
+        closePrice,
+        realizedProfit: protectionExit ? highestProfit : Number(realizedAtClose) || 0,
+        highestProfit,
+        closeReason: reason,
+        closedAt: new Date().toISOString()
+      });
+    } catch (_) {}
   }
 
   async persistPosition(pos, force = false) {
@@ -4121,41 +4157,7 @@ export class OkxMonitorDO extends DurableObject {
     }
   }
 
-  async flushPendingCloses() {
-    if (!this.env.DB || isD1WriteBlocked()) return;
-    let entries;
-    try { entries = await this.state.storage.list({ prefix: "closed:" }); } catch (_) { return; }
-    for (const [key, record] of entries) {
-      if (!record || !record.id) continue;
-      try {
-        await this.env.DB.prepare(`
-          UPDATE signal_positions
-          SET status='CLOSED',
-              closed_at=COALESCE(closed_at, datetime('now')),
-              close_price=?,
-              realized_profit_pct=?,
-              highest_profit_pct=?,
-              close_reason=?,
-              updated_at=datetime('now')
-          WHERE id=? AND status IN ('OPEN','CLOSING')
-        `).bind(
-          Number(record.closePrice),
-          Number(record.realizedProfitPct || 0),
-          Number(record.highestProfitPct || 0),
-          String(record.reason || "Risk exit"),
-          Number(record.id)
-        ).run();
-        await this.state.storage.delete(key);
-        console.log("OKX MONITOR CLOSE D1 FLUSHED", record.symbol || record.id);
-      } catch (error) {
-        if (blockD1Writes(error, "flushPendingClose")) return;
-        console.error("OKX MONITOR CLOSE D1 FLUSH ERROR", record.symbol || record.id, error);
-      }
-    }
-  }
-
   async flushPositionsToD1() {
-    await this.flushPendingCloses();
     for (const pos of this.positions.values()) {
       await this.persistPosition(pos, true);
     }
