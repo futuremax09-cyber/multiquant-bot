@@ -1427,8 +1427,26 @@ function detectLanguage(text) {
    NEWS — RSS
 ============================================================ */
 
+function normalizeNewsTitle(title) {
+  return String(title || "")
+    .toLowerCase()
+    .replace(/&amp;/g, "and")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function runNewsJob(env) {
   if (!isEnabled(env, "NEWS_ENABLED", true)) return;
+
+  // News deduplication depends on D1 metadata. If D1 writes are blocked,
+  // do not publish news that cannot be marked as published; otherwise the
+  // same story can be sent again on the next cron tick.
+  if (isD1WriteBlocked()) {
+    console.log("NEWS SKIPPED D1 WRITE BLOCKED");
+    return;
+  }
+
   if (await hasRecentNewsPost(env, 30)) return;
 
   const feeds = getNewsFeeds(env);
@@ -1455,9 +1473,21 @@ async function runNewsJob(env) {
     }
   }
 
+  const runTitleKeys = new Set();
+
   for (const item of collected) {
-    const key = "news:" + simpleHash(item.link);
-    if (await hasMeta(env, key)) continue;
+    const normalizedTitle = normalizeNewsTitle(item.title);
+    if (!normalizedTitle) continue;
+
+    // Protect against the same story appearing from multiple feeds with
+    // different URLs. Link-only dedup is not sufficient for syndicated news.
+    const titleKey = "news:title:" + simpleHash(normalizedTitle);
+    const linkKey = "news:link:" + simpleHash(item.link);
+
+    if (runTitleKeys.has(titleKey)) continue;
+    if (await hasMeta(env, titleKey)) continue;
+    if (await hasMeta(env, linkKey)) continue;
+    runTitleKeys.add(titleKey);
 
     // Reject obvious low-value/general stories before spending a Gemini request.
     if (!isImpactfulNewsCandidate(item)) continue;
@@ -1494,7 +1524,10 @@ async function runNewsJob(env) {
 
       const sent = await sendNewsChannel(env, finalText);
       if (sent) {
-        await setMeta(env, key, "1");
+        // Store both URL and normalized-title fingerprints. This prevents
+        // syndicated copies of the same story from being reposted.
+        await setMeta(env, linkKey, "1");
+        await setMeta(env, titleKey, "1");
         await setMeta(env, "news:last_published", String(Date.now()));
       }
       return;
@@ -3417,6 +3450,12 @@ export class OkxMonitorDO extends DurableObject {
     // calculations stay real-time in memory; D1 is only persisted periodically.
     this.lastPersistAt = new Map();
     this.persistIntervalMs = 30 * 1000;
+    // TP notifications must remain idempotent even if D1 is unavailable or
+    // the Durable Object is restarted. These keys live in DO storage, not D1.
+    this.tpNotificationKeys = new Set();
+    this.tpNotificationReady = this.state.storage.list({ prefix: "tpnotify:" }).then(entries => {
+      for (const key of entries.keys()) this.tpNotificationKeys.add(key);
+    }).catch(() => {});
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
     this.connectWebSocket();
@@ -3832,6 +3871,14 @@ export class OkxMonitorDO extends DurableObject {
       }
     }
     for (const hit of newlyReached) {
+      // A TP notification is a one-time event per signal/target. This remains
+      // true across D1 quota outages and Durable Object restarts.
+      await this.tpNotificationReady;
+      const notifyKey = `tpnotify:${Number(pos.id)}:${hit.name}`;
+      if (this.tpNotificationKeys.has(notifyKey)) continue;
+      this.tpNotificationKeys.add(notifyKey);
+      try { await this.state.storage.put(notifyKey, Date.now()); } catch (_) {}
+
       const pct = Math.abs((Number(hit.price)-Number(pos.entry_mid))/Number(pos.entry_mid))*1000;
       const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*"+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
       if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
