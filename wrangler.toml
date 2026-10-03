@@ -7,20 +7,6 @@ keep_vars = true
 enabled = true
 head_sampling_rate = 1
 
-[vars]
-BOT_USERNAME = "multiquantacademybot"
-CHANNEL_USERNAME = "@multiquantacademy"
-CHANNEL_CHAT_ID = "@multiquantacademy"
-TEAM_ALERT_CHAT_ID = "-5218515529"
-
-GEMINI_MODEL = "gemini-3.1-flash-lite"
-
-SIGNAL_SCAN_INTERVAL_MINUTES = "15"
-SIGNAL_MAX_24H = "30"
-SIGNAL_MIN_GAP_MINUTES = "25"
-
-OKX_WS_URL = "wss://ws.okx.com/ws/v5/business"
-
 [[d1_databases]]
 binding = "DB"
 database_name = "multiquant-db"
@@ -33,7 +19,6 @@ class_name = "OkxMonitorDO"
 [exports.OkxMonitorDO]
 type = "durable-object"
 storage = "sqlite"
-main = "worker.js"
 
 [triggers]
 crons = ["*/5 * * * *"]
