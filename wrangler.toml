@@ -33,6 +33,7 @@ class_name = "OkxMonitorDO"
 [exports.OkxMonitorDO]
 type = "durable-object"
 storage = "sqlite"
+main = "worker.js"
 
 [triggers]
 crons = ["*/5 * * * *"]
