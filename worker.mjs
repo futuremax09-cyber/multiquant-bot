@@ -3370,6 +3370,7 @@ export class OkxMonitorDO extends DurableObject {
     this.reconnectAttempts = 0;
     this.heartbeatTimer = null;
     this.lastWsMessageAt = Date.now();
+    this.lastWsPingAt = 0;
     this.lastSyncAt = 0;
     this.tickerCache = new Map();
     this.tickersSubscribed = false;
@@ -3379,6 +3380,7 @@ export class OkxMonitorDO extends DurableObject {
     this.tickerReconnectAttempts = 0;
     this.tickerHeartbeatTimer = null;
     this.lastTickerWsMessageAt = Date.now();
+    this.lastTickerWsPingAt = 0;
     // D1 persistence is intentionally throttled because OKX candle5m sends
     // live updates repeatedly while a candle is forming. Monitoring/TP/SL
     // calculations stay real-time in memory; D1 is only persisted periodically.
@@ -3534,7 +3536,11 @@ export class OkxMonitorDO extends DurableObject {
 
       ws.addEventListener("message", async (event) => {
         this.lastWsMessageAt = Date.now();
-        await this.handleWsMessage(event.data);
+        const raw = event && event.data;
+        if (typeof raw === "string" && raw.toLowerCase() === "pong") {
+          console.log("OKX MONITOR WS PONG");
+        }
+        await this.handleWsMessage(raw);
       });
 
       ws.addEventListener("close", (event) => {
@@ -3564,17 +3570,35 @@ export class OkxMonitorDO extends DurableObject {
 
   startHeartbeat() {
     this.stopHeartbeat();
+    this.lastWsPingAt = 0;
+    // OKX closes an otherwise quiet WebSocket after ~30s. Send the protocol
+    // ping regularly rather than waiting for the connection to become idle.
+    // Also keep a watchdog so a missing pong cannot leave a dead socket stuck.
     this.heartbeatTimer = setInterval(() => {
       try {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - this.lastWsMessageAt >= 25000) {
-          this.ws.send("ping");
-          console.log("OKX MONITOR WS HEARTBEAT");
+        const ws = this.ws;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+        const now = Date.now();
+        const sinceMessage = now - Number(this.lastWsMessageAt || 0);
+        const sincePing = now - Number(this.lastWsPingAt || 0);
+
+        if (sincePing >= 15000) {
+          ws.send("ping");
+          this.lastWsPingAt = now;
+          console.log("OKX MONITOR WS HEARTBEAT", JSON.stringify({ sinceMessageMs: sinceMessage }));
+        }
+
+        // If OKX does not answer any ping/message for ~28s, force a clean
+        // reconnect before the server's 30s idle timeout can kill the socket.
+        if (sinceMessage >= 28000) {
+          console.warn("OKX MONITOR WS STALE", JSON.stringify({ sinceMessageMs: sinceMessage }));
+          try { ws.close(4000, "heartbeat timeout"); } catch (_) {}
         }
       } catch (error) {
         console.error("OKX MONITOR WS HEARTBEAT ERROR", error);
       }
-    }, 10000);
+    }, 5000);
   }
 
   stopHeartbeat() {
@@ -3639,17 +3663,27 @@ export class OkxMonitorDO extends DurableObject {
   startTickerHeartbeat() {
     this.stopTickerHeartbeat();
     this.lastTickerWsMessageAt = Date.now();
+    this.lastTickerWsPingAt = 0;
     this.tickerHeartbeatTimer = setInterval(() => {
       try {
-        if (!this.tickerWs || this.tickerWs.readyState !== WebSocket.OPEN) return;
-        if (Date.now() - this.lastTickerWsMessageAt >= 20000) {
-          this.tickerWs.send("ping");
-          console.log("OKX TICKER WS HEARTBEAT");
+        const ws = this.tickerWs;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const now = Date.now();
+        const sinceMessage = now - Number(this.lastTickerWsMessageAt || 0);
+        const sincePing = now - Number(this.lastTickerWsPingAt || 0);
+        if (sincePing >= 15000) {
+          ws.send("ping");
+          this.lastTickerWsPingAt = now;
+          console.log("OKX TICKER WS HEARTBEAT", JSON.stringify({ sinceMessageMs: sinceMessage }));
+        }
+        if (sinceMessage >= 28000) {
+          console.warn("OKX TICKER WS STALE", JSON.stringify({ sinceMessageMs: sinceMessage }));
+          try { ws.close(4000, "heartbeat timeout"); } catch (_) {}
         }
       } catch (error) {
         console.error("OKX TICKER WS HEARTBEAT ERROR", error);
       }
-    }, 10000);
+    }, 5000);
   }
 
   stopTickerHeartbeat() {
@@ -3700,7 +3734,11 @@ export class OkxMonitorDO extends DurableObject {
 
       ws.addEventListener("message", async (event) => {
         this.lastTickerWsMessageAt = Date.now();
-        await this.handleTickerWsMessage(event.data);
+        const raw = event && event.data;
+        if (typeof raw === "string" && raw.toLowerCase() === "pong") {
+          console.log("OKX TICKER WS PONG");
+        }
+        await this.handleTickerWsMessage(raw);
       });
 
       ws.addEventListener("close", (event) => {

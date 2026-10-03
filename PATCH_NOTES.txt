@@ -33,3 +33,12 @@ MULTIQUANT REBUILD
     not replaced with an unrelated strategy.
 
 12. No secrets are included in this package.
+
+13. OKX WebSocket heartbeat was hardened without changing signal-generation logic:
+    - monitor and ticker sockets send protocol ping every 15 seconds;
+    - every incoming message/pong refreshes the activity timestamp;
+    - a 28-second no-inbound-message watchdog closes the stale socket so the existing
+      reconnect/backoff path can establish a fresh connection before OKX's 30-second
+      idle timeout;
+    - added explicit WS PONG / STALE diagnostics.
+14. OKX monitor default remains wss://ws.okx.com/ws/v5/business. No 8443 change was made.
