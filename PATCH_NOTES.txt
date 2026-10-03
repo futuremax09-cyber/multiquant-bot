@@ -1,9 +1,35 @@
-MultiQuant production patch
+MULTIQUANT REBUILD
+==================
 
-1. D1 daily-write circuit breaker no longer blocks live OKX position close decisions.
-2. Close state is kept in Durable Object storage while D1 persistence is deferred/retried.
-3. Stale OPEN rows are not resurrected when a local close marker exists.
-4. TP replies use: happy face + check mark, hit time, price, profit, with spacing.
-5. Close/SL replies include exit/SL hit time and only targets actually hit; no red X targets.
-6. /positions target status also lists only targets actually hit.
-7. Existing signal-generation logic and wrangler configuration were not intentionally changed.
+1. Worker entry changed from worker.js to worker.mjs.
+   Reason: force Cloudflare/Node module parsing for the Durable Object export.
+
+2. package.json includes "type": "module".
+
+3. Removed the broken nested legacy block-comment section around monitorOpenSignals.
+   The old block contained section comments inside an outer comment, which could close
+   the comment early and leave a stray */ later in the file. This was the actual syntax
+   boundary behind the Unexpected "export" build failure.
+
+4. TEAM_ALERT_CHAT_ID is now the team alert destination; ADMIN_CHAT_ID no longer
+   overrides it for new-member alerts.
+
+5. Added the missing sendTelegramReply helper used by Durable Object TP/close alerts.
+
+6. TP replies now include Entry and the next-target message.
+
+7. Protection closes are not intentionally blocked just because D1 is temporarily
+   unavailable. Durable Object storage retains closed state until D1 can be updated.
+
+8. /positions filters stale D1 OPEN rows that the Durable Object has already closed.
+
+9. /positions summary includes total profit, total loss and net P/L and avoids displaying
+   a fake "Targets Hit: None" line.
+
+10. Rapid PUMP/DUMP monitoring and daily Top Gainers/Top Losers publishing were added
+    with Durable Object deduplication.
+
+11. The established signal-generation path remains the basis of normal signals; it was
+    not replaced with an unrelated strategy.
+
+12. No secrets are included in this package.

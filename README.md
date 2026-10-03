@@ -1,33 +1,66 @@
-# MultiQuant Academy Bot
+# MultiQuant Academy Bot — Rebuild
 
-Production Cloudflare Worker for MultiQuant Academy.
+Production-ready Cloudflare Worker package for the MultiQuant Academy Telegram + OKX crypto signal system.
 
 ## Runtime
 
 - Cloudflare Workers
-- D1: `multiquant-db`
-- Durable Object: `OkxMonitorDO` / `OKX_MONITOR`
+- D1: `multiquant-db` (`DB` binding)
+- Durable Object: `OkxMonitorDO` (`OKX_MONITOR` binding)
 - Telegram Bot API
 - Gemini
-- OKX USDT perpetual market data
-- RSS news and economic-event modules
+- OKX USDT-margined perpetuals
+- RSS crypto/finance news
+- Economic-event alerts
+- Lead qualification + follow-ups
 
-## Important: secrets and dashboard variables
+## Important deployment fix
 
-This repository intentionally does **not** contain Telegram or Gemini secrets.
-Existing Cloudflare dashboard Variables and Secrets are preserved by `keep_vars = true` in `wrangler.toml`.
-Do not commit `.dev.vars`, `.env`, API keys, or bot tokens.
+The Worker entry file is intentionally `worker.mjs` and `wrangler.toml` points to it directly. This forces module parsing and avoids the previous `Unexpected "export"` build failure around the Durable Object export.
 
-Expected existing Cloudflare secrets include:
+`package.json` also contains `"type": "module"`.
+
+## Files
+
+- `worker.mjs` — complete Worker
+- `wrangler.toml` — Worker, D1, Durable Object and cron configuration
+- `package.json` — module/deploy configuration
+- `MASTER_LOGIC.md` — signal, TP/SL, positions, alerts, news, economics and onboarding rules
+- `PATCH_NOTES.txt` — rebuild/fix notes
+
+## Required Cloudflare secrets
+
+Keep these in Cloudflare Dashboard, never in GitHub:
 
 - `TELEGRAM_BOT_TOKEN`
 - `GEMINI_API_KEY`
 
-The Worker also reads the existing dashboard variables such as `BOT_USERNAME`, `CHANNEL_CHAT_ID`, `CHANNEL_USERNAME`, `GEMINI_MODEL`, `OKX_WS_URL`, `SIGNAL_MAX_24H`, `SIGNAL_MIN_GAP_MINUTES`, `SIGNAL_SCAN_INTERVAL_MINUTES`, and `TEAM_ALERT_CHAT_ID`.
+## Existing dashboard variables supported
+
+The Worker reads existing Cloudflare variables such as:
+
+- `BOT_USERNAME`
+- `CHANNEL_USERNAME`
+- `CHANNEL_CHAT_ID`
+- `TEAM_ALERT_CHAT_ID`
+- `ADMIN_CHAT_ID`
+- `GEMINI_MODEL`
+- `OKX_WS_URL`
+- `OKX_PUBLIC_WS_URL`
+- `SIGNAL_MAX_24H`
+- `SIGNAL_MIN_GAP_MINUTES`
+- `SIGNAL_SCAN_INTERVAL_MINUTES`
+- `SIGNALS_ENABLED`
+- `NEWS_ENABLED`
+- `ECONOMIC_ENABLED`
+- `FOLLOWUPS_ENABLED`
+- `CRON_SECRET`
+- `TELEGRAM_WEBHOOK_SECRET`
+- `WORKER_PUBLIC_URL`
+
+Do not commit secrets or `.dev.vars`.
 
 ## Deploy
-
-From this directory:
 
 ```bash
 npm install
@@ -35,18 +68,46 @@ npm run dry-run
 npm run deploy
 ```
 
-Do not add secrets to GitHub. Cloudflare Secrets remain on the Worker.
+Cloudflare Build settings can continue using:
 
-## Signal / trade monitoring notes
+```text
+Deploy command: npx wrangler deploy
+Root directory: /
+```
 
-The existing signal-generation/scoring path is kept intact in `worker.js`. The rebuild focuses on deployment configuration, D1-write pressure, Telegram reply correctness, and duplicate-safe target/close notifications.
+No manual package.json module workaround is required beyond the included files.
 
-Target and close updates are replies to the original signal message. Target completion is not committed to D1 until the Telegram reply succeeds. Durable Object storage is used as an additional idempotency layer.
+## Telegram
 
-## Lead flow
+The bot should be admin in `@multiquantacademy` if channel member updates are required. The webhook uses:
 
-The channel member flow uses the existing five-button onboarding. The copy-trading option is explicitly **Forex & Gold Copy Trading**, while Crypto Copy Trading remains a separate option. Existing Crypto/Forex/Stocks team environment variables remain supported; team-specific chat IDs are preferred when present, with the existing `TEAM_ALERT_CHAT_ID` kept as fallback.
+```text
+message
+callback_query
+chat_member
+```
+
+The channel onboarding buttons are:
+
+1. Forex Trading
+2. Copy Trading in Forex
+3. Indian Stock Market
+4. Crypto Premium Signals
+5. Crypto Copy Trading
+
+Team alerts use `TEAM_ALERT_CHAT_ID`; `ADMIN_CHAT_ID` is not used as a fallback destination for new-member team alerts.
+
+## Signal system
+
+- OKX USDT perpetual universe is loaded dynamically.
+- One public signal maximum per signal scan.
+- Existing D1 24-hour quota and minimum-gap controls are preserved.
+- The full ticker universe is ranked first; a larger setup candidate pool is then evaluated.
+- Signal format remains the locked USDT-M format with Entry, TP1/TP2/TP3, SL, setup and hashtags.
+- TP/SL monitoring is handled by the Durable Object using OKX 5-minute candles.
+- TP notifications and close notifications are replies to the original signal.
+- D1 write exhaustion does not intentionally stop the in-memory/Durable-Object monitoring path.
 
 ## No test posts
 
-Do not send test Telegram messages during deployment. Verify production through Cloudflare deployment/observability and the bot's normal traffic.
+Deployment does not send test Telegram posts. Verify through Worker logs and normal production traffic.
