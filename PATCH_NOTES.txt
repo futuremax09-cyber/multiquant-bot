@@ -1,44 +1,14 @@
-MULTIQUANT REBUILD
-==================
+MultiQuant production patch
 
-1. Worker entry changed from worker.js to worker.mjs.
-   Reason: force Cloudflare/Node module parsing for the Durable Object export.
-
-2. package.json includes "type": "module".
-
-3. Removed the broken nested legacy block-comment section around monitorOpenSignals.
-   The old block contained section comments inside an outer comment, which could close
-   the comment early and leave a stray */ later in the file. This was the actual syntax
-   boundary behind the Unexpected "export" build failure.
-
-4. TEAM_ALERT_CHAT_ID is now the team alert destination; ADMIN_CHAT_ID no longer
-   overrides it for new-member alerts.
-
-5. Added the missing sendTelegramReply helper used by Durable Object TP/close alerts.
-
-6. TP replies now include Entry and the next-target message.
-
-7. Protection closes are not intentionally blocked just because D1 is temporarily
-   unavailable. Durable Object storage retains closed state until D1 can be updated.
-
-8. /positions filters stale D1 OPEN rows that the Durable Object has already closed.
-
-9. /positions summary includes total profit, total loss and net P/L and avoids displaying
-   a fake "Targets Hit: None" line.
-
-10. Rapid PUMP/DUMP monitoring and daily Top Gainers/Top Losers publishing were added
-    with Durable Object deduplication.
-
-11. The established signal-generation path remains the basis of normal signals; it was
-    not replaced with an unrelated strategy.
-
-12. No secrets are included in this package.
-
-13. OKX WebSocket heartbeat was hardened without changing signal-generation logic:
-    - monitor and ticker sockets send protocol ping every 15 seconds;
-    - every incoming message/pong refreshes the activity timestamp;
-    - a 28-second no-inbound-message watchdog closes the stale socket so the existing
-      reconnect/backoff path can establish a fresh connection before OKX's 30-second
-      idle timeout;
-    - added explicit WS PONG / STALE diagnostics.
-14. OKX monitor default remains wss://ws.okx.com/ws/v5/business. No 8443 change was made.
+1. OKX monitor WebSocket: ignore plain-text pong before JSON.parse.
+2. OKX ticker WebSocket: ignore plain-text pong before JSON.parse.
+3. Keep OKX business WS URL as wss://ws.okx.com/ws/v5/business.
+4. Keep heartbeat/reconnect logic; no signal-generation logic changed.
+5. Locked signal post wording retained, including:
+   "Move your SL to entry after the first target is hit."
+6. TP1/TP2/TP3 notifications updated to the locked short formats.
+7. TP3 is a milestone only; position remains open and continues monitoring.
+8. Post-TP3 reversal/protection close reports Maximum Profit and uses the maximum-price point as Closed Price.
+9. No "Favorable" wording is used.
+10. Direct SL uses the locked "SL HIT" short format; no "RISK EXIT" or "Reason: Hard Stop Loss".
+11. No change to the existing signal-generation/selection logic.

@@ -2084,8 +2084,8 @@ async function runSignalJob(env, tickers) {
           "TP2: `" + setup.tp2 + "` — " + setup.tp2Pct + "%\n" +
           "TP3: `" + setup.tp3 + "` — " + setup.tp3Pct + "%\n\n" +
           "SL: `" + setup.sl + "`\n\n" +
-          "_⚠️ Move your SL to entry after the first target is hit._\n\n" +
-          "_📊 Trade Setup: " + setup.tradeSetup + " — " + setup.timeframe + "_\n\n" +
+          "⚠️ Move your SL to entry after the first target is hit.\n\n" +
+          "📊 Trade Setup: " + setup.tradeSetup + " — " + setup.timeframe + "\n\n" +
           "#BTCUSDT #BTC #CRYPTO #" + setup.coinTag;
 
         const sent = await sendPublicChannel(env, text);
@@ -3736,8 +3736,9 @@ export class OkxMonitorDO extends DurableObject {
       ws.addEventListener("message", async (event) => {
         this.lastTickerWsMessageAt = Date.now();
         const raw = event && event.data;
-        if (typeof raw === "string" && raw.toLowerCase() === "pong") {
+        if (typeof raw === "string" && raw.trim().toLowerCase() === "pong") {
           console.log("OKX TICKER WS PONG");
+          return;
         }
         await this.handleTickerWsMessage(raw);
       });
@@ -3782,9 +3783,17 @@ export class OkxMonitorDO extends DurableObject {
 
   async handleTickerWsMessage(raw) {
     try {
-      if (typeof raw === "string" && raw.toLowerCase() === "ping") {
-        if (this.tickerWs && this.tickerWs.readyState === WebSocket.OPEN) this.tickerWs.send("pong");
-        return;
+      if (typeof raw === "string") {
+        const control = raw.trim().toLowerCase();
+        if (control === "pong") {
+          this.lastTickerWsMessageAt = Date.now();
+          console.log("OKX TICKER WS PONG");
+          return;
+        }
+        if (control === "ping") {
+          if (this.tickerWs && this.tickerWs.readyState === WebSocket.OPEN) this.tickerWs.send("pong");
+          return;
+        }
       }
       const message = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (!message) return;
@@ -3857,9 +3866,17 @@ export class OkxMonitorDO extends DurableObject {
 
   async handleWsMessage(raw) {
     try {
-      if (typeof raw === "string" && raw.toLowerCase() === "ping") {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send("pong");
-        return;
+      if (typeof raw === "string") {
+        const control = raw.trim().toLowerCase();
+        if (control === "pong") {
+          this.lastWsMessageAt = Date.now();
+          console.log("OKX MONITOR WS PONG");
+          return;
+        }
+        if (control === "ping") {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send("pong");
+          return;
+        }
       }
       const message = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (!message) return;
@@ -3923,8 +3940,28 @@ export class OkxMonitorDO extends DurableObject {
       this.tpNotificationKeys.add(notifyKey);
 
       const pct = Math.abs((Number(hit.price)-Number(pos.entry_mid))/Number(pos.entry_mid))*1000;
-      const nextTarget = hit.name === "TP1" ? "TP2 coming soon ...." : (hit.name === "TP2" ? "TP3 coming soon ...." : "Position near final target.");
-      const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n\n🎯 Entry: `"+reportFmt(pos.entry_mid)+"`\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*\n\n"+nextTarget+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
+      let msg = "";
+      if (hit.name === "TP1") {
+        msg = "😊 *TP1 HIT* ✅\n\n" +
+          "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
+          "Entry: `" + reportFmt(pos.entry_mid) + "`\n" +
+          "💰 Price: `" + reportFmt(hit.price) + "`\n" +
+          "📈 Profit: *+" + pct.toFixed(1) + "%*\n\n" +
+          "🎯 TP2 coming soon ....";
+      } else if (hit.name === "TP2") {
+        msg = "😊 *TP2 HIT* ✅\n\n" +
+          "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
+          "Entry: `" + reportFmt(pos.entry_mid) + "`\n" +
+          "💰 Price: `" + reportFmt(hit.price) + "`\n" +
+          "📈 Profit: *+" + pct.toFixed(1) + "%*\n\n" +
+          "🎯 TP3 coming soon ....";
+      } else {
+        msg = "🏆 *TP3 HIT* ✅\n\n" +
+          "📌 " + pos.pair + " — " + pos.direction + "\n\n" +
+          "Entry: `" + reportFmt(pos.entry_mid) + "`\n" +
+          "💰 Price: `" + reportFmt(hit.price) + "`\n" +
+          "📈 Profit: *+" + pct.toFixed(1) + "%*";
+      }
       try {
         if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
       } finally {
@@ -3957,7 +3994,7 @@ export class OkxMonitorDO extends DurableObject {
       symbol: pos.symbol,
       pair: pos.pair,
       direction: pos.direction,
-      closePrice,
+      closePrice: anyTp ? peak : closePrice,
       reportProfit,
       peakPct,
       reason,
@@ -3976,18 +4013,20 @@ export class OkxMonitorDO extends DurableObject {
     this.closedPositions.set(String(pos.id), closedState);
     pos.status="CLOSED"; this.positions.delete(symbol); await this.reconcileSubscriptions(false);
     const hitTargets = formatHitTargets(pos);
+    const finalClosePrice = anyTp ? peak : closePrice;
     const msg = anyTp
       ? "🔒 *SIGNAL CLOSED*\n\n"+
         "📌 "+pos.pair+" — "+pos.direction+"\n\n"+
-        "💰 Closed Price: `"+reportFmt(closePrice)+"`\n"+
-        "📊 Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
-        "🏆 Highest Favorable Price: `"+reportFmt(peak)+"`\n"+
-        "🏆 Highest Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
+        "Entry: `"+reportFmt(pos.entry_mid)+"`\n"+
+        "💰 Closed Price: `"+reportFmt(finalClosePrice)+"`\n"+
+        "📈 Profit: *+"+peakPct.toFixed(1)+"%*\n\n"+
         (hitTargets ? "🎯 Targets Hit: *"+hitTargets+"*\n\n" : "")+
-        "🔒 *Profit Protected*\n🔒 Position Closed"
-      : "😔 *SL HIT*\n\n"+
+        "🛡 *Profit Protected*\n"+
+        "🔒 Position Closed"
+      : "😔 *SL HIT* ❌\n\n"+
         "📌 "+pos.pair+" — "+pos.direction+"\n\n"+
-        "💰 SL Price: `"+reportFmt(closePrice)+"`\n"+
+        "Entry: `"+reportFmt(pos.entry_mid)+"`\n"+
+        "🛑 SL Price: `"+reportFmt(closePrice)+"`\n"+
         "📉 Loss: *"+(realizedAtClose>=0?"+":"")+realizedAtClose.toFixed(1)+"%*\n\n"+
         "🔒 Position Closed";
     try { if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id); } finally {
