@@ -54,6 +54,43 @@ import { DurableObject } from "cloudflare:workers";
  * See /setup-webhook below.
  */
 
+let d1WriteBlockedUntil = 0;
+let d1WriteBlockLoggedUntil = 0;
+
+function isD1QuotaError(error) {
+  const msg = String(error && error.message ? error.message : error || "").toLowerCase();
+  return msg.includes("exceeded d1's free tier daily row write limit") ||
+    msg.includes("daily row write limit") ||
+    msg.includes("d1 free tier daily row write limit");
+}
+
+function nextUtcMidnightMs() {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  return next.getTime() + 1000;
+}
+
+function isD1WriteBlocked() {
+  if (Date.now() >= d1WriteBlockedUntil) {
+    d1WriteBlockedUntil = 0;
+    return false;
+  }
+  return true;
+}
+
+function blockD1Writes(error, context) {
+  if (!isD1QuotaError(error)) return false;
+  d1WriteBlockedUntil = Math.max(d1WriteBlockedUntil, nextUtcMidnightMs());
+  if (Date.now() >= d1WriteBlockLoggedUntil) {
+    d1WriteBlockLoggedUntil = Date.now() + 60000;
+    console.warn("D1 WRITE CIRCUIT BREAKER", JSON.stringify({
+      context: context || "unknown",
+      blockedUntil: new Date(d1WriteBlockedUntil).toISOString()
+    }));
+  }
+  return true;
+}
+
 const DEFAULTS = {
   BOT_USERNAME: "multiquantacademybot",
   CHANNEL_USERNAME: "@multiquantacademy",
@@ -1390,48 +1427,9 @@ function detectLanguage(text) {
    NEWS — RSS
 ============================================================ */
 
-let newsCooldownUntil = 0;
-let newsJobLockUntil = 0;
-
-async function getNewsCooldownRequest(env) {
-  const channel = getEnv(env, "CHANNEL_CHAT_ID", DEFAULTS.CHANNEL_CHAT_ID) || "default";
-  return new Request("https://multiquant-news-cooldown.invalid/" + encodeURIComponent(channel));
-}
-
-async function cacheHasNewsCooldown(env) {
-  try {
-    const req = await getNewsCooldownRequest(env);
-    const hit = await caches.default.match(req);
-    return !!hit;
-  } catch (_) {
-    return false;
-  }
-}
-
-async function cacheSetNewsCooldown(env, seconds) {
-  try {
-    const req = await getNewsCooldownRequest(env);
-    await caches.default.put(req, new Response("1", {
-      headers: { "Cache-Control": "max-age=" + String(seconds) }
-    }));
-  } catch (_) {}
-}
-
 async function runNewsJob(env) {
   if (!isEnabled(env, "NEWS_ENABLED", true)) return;
-
-  const nowMs = Date.now();
-  if (nowMs < newsCooldownUntil || nowMs < newsJobLockUntil) return;
-  if (await cacheHasNewsCooldown(env)) {
-    newsCooldownUntil = Date.now() + 30 * 60 * 1000;
-    return;
-  }
   if (await hasRecentNewsPost(env, 30)) return;
-
-  // Prevent overlapping scheduled invocations from all publishing at once.
-  // This lock is intentionally short and is released on failure.
-  newsJobLockUntil = Date.now() + 2 * 60 * 1000;
-  await cacheSetNewsCooldown(env, 2 * 60);
 
   const feeds = getNewsFeeds(env);
   if (!feeds.length) return;
@@ -1496,47 +1494,21 @@ async function runNewsJob(env) {
 
       const sent = await sendNewsChannel(env, finalText);
       if (sent) {
-        newsCooldownUntil = Date.now() + 30 * 60 * 1000;
-        newsJobLockUntil = newsCooldownUntil;
-        await cacheSetNewsCooldown(env, 30 * 60);
-        // D1 metadata is now best-effort. The cache/local cooldown above
-        // prevents a D1 quota failure from causing a news blast.
-        try { await setMeta(env, key, "1"); } catch (_) {}
-        try { await setMeta(env, "news:last_published", String(Date.now())); } catch (_) {}
-      } else {
-        newsJobLockUntil = 0;
-        try {
-          const req = await getNewsCooldownRequest(env);
-          await caches.default.delete(req);
-        } catch (_) {}
+        await setMeta(env, key, "1");
+        await setMeta(env, "news:last_published", String(Date.now()));
       }
       return;
     } catch (error) {
       console.error("NEWS ITEM ERROR", error);
-      newsJobLockUntil = 0;
-      try {
-        const req = await getNewsCooldownRequest(env);
-        await caches.default.delete(req);
-      } catch (_) {}
     }
   }
 }
 
 async function hasRecentNewsPost(env, minutes) {
-  if (Date.now() < newsCooldownUntil) return true;
-  if (await cacheHasNewsCooldown(env)) {
-    newsCooldownUntil = Date.now() + Number(minutes) * 60000;
-    return true;
-  }
   if (!env.DB) return false;
-  try {
-    const value = await getMeta(env, "news:last_published");
-    if (!value) return false;
-    return (Date.now() - Number(value)) < (Number(minutes) * 60000);
-  } catch (_) {
-    // If D1 is unavailable/exhausted, do not treat that as permission to post.
-    return true;
-  }
+  const value = await getMeta(env, "news:last_published");
+  if (!value) return false;
+  return (Date.now() - Number(value)) < (Number(minutes) * 60000);
 }
 
 function isImpactfulNewsCandidate(item) {
@@ -2049,6 +2021,10 @@ async function runSignalJob(env, tickers) {
 
       const hourKey = Math.floor(Date.now() / 3600000);
       const eventKey = "open:" + setup.symbol + ":" + setup.direction + ":" + hourKey;
+      if (isD1WriteBlocked()) {
+        console.log("SIGNAL D1 WRITE BLOCK", setup.symbol);
+        break;
+      }
       if (!(await claimSignalEvent(env, eventKey))) continue;
 
       try {
@@ -2068,15 +2044,26 @@ async function runSignalJob(env, tickers) {
 
         const sent = await sendPublicChannel(env, text);
         if (sent && sent.message_id) {
-          await createSignalPosition(env, setup, sent.message_id);
-          await recordSignalHistory(env, setup, sent.message_id);
+          const created = await createSignalPosition(env, setup, sent.message_id);
+          if (!created || isD1WriteBlocked()) {
+            console.warn("SIGNAL D1 PERSIST BLOCKED", setup.symbol);
+            break;
+          }
+          const recorded = await recordSignalHistory(env, setup, sent.message_id);
+          if (!recorded || isD1WriteBlocked()) {
+            console.warn("SIGNAL D1 HISTORY BLOCKED", setup.symbol);
+            break;
+          }
           await setMeta(env, "signal:okx:" + setup.symbol + ":" + setup.direction + ":" + hourKey, "1");
         } else {
           await releaseSignalEvent(env, eventKey);
         }
       } catch (error) {
-        await releaseSignalEvent(env, eventKey);
-        throw error;
+        if (!blockD1Writes(error, "runSignalJob")) {
+          await releaseSignalEvent(env, eventKey);
+          throw error;
+        }
+        break;
       }
     }
   } catch (error) {
@@ -2099,6 +2086,7 @@ async function ensureSignalHistory(env) {
 }
 
 async function getSignalQuota(env) {
+  if (isD1WriteBlocked()) return { allowed: false, blocked: true, reason: "D1_WRITE_BLOCKED" };
   await ensureSignalHistory(env);
 
   const max24h = Number(
@@ -2158,6 +2146,7 @@ async function getSignalQuota(env) {
 }
 
 async function recordSignalHistory(env, setup, messageId) {
+  if (!env.DB || isD1WriteBlocked()) return false;
   await ensureSignalHistory(env);
 
   const symbol = String(setup && setup.symbol || "").trim();
@@ -2168,16 +2157,22 @@ async function recordSignalHistory(env, setup, messageId) {
   ).trim();
   const direction = String(setup && setup.direction || "").trim();
 
-  await env.DB.prepare(`
-    INSERT INTO signal_history
-      (symbol, pair, direction, channel_message_id, sent_at)
-    VALUES (?, ?, ?, ?, datetime('now'))
-  `).bind(
-    symbol,
-    pair,
-    direction,
-    Number(messageId)
-  ).run();
+  try {
+    await env.DB.prepare(`
+      INSERT INTO signal_history
+        (symbol, pair, direction, channel_message_id, sent_at)
+      VALUES (?, ?, ?, ?, datetime('now'))
+    `).bind(
+      symbol,
+      pair,
+      direction,
+      Number(messageId)
+    ).run();
+    return true;
+  } catch (error) {
+    if (blockD1Writes(error, "recordSignalHistory")) return false;
+    throw error;
+  }
 }
 
 async function ensureSignalEventGuard(env) {
@@ -2191,7 +2186,7 @@ async function ensureSignalEventGuard(env) {
 }
 
 async function claimSignalEvent(env, eventKey) {
-  if (!env.DB || !eventKey) return false;
+  if (!env.DB || !eventKey || isD1WriteBlocked()) return false;
   try {
     await ensureSignalEventGuard(env);
     const result = await env.DB.prepare(`
@@ -2200,17 +2195,20 @@ async function claimSignalEvent(env, eventKey) {
     `).bind(String(eventKey)).run();
     return Number(result && result.meta && result.meta.changes || 0) === 1;
   } catch (error) {
+    if (blockD1Writes(error, "claimSignalEvent")) return false;
     console.error("SIGNAL EVENT CLAIM ERROR", eventKey, error);
     return false;
   }
 }
 
 async function releaseSignalEvent(env, eventKey) {
-  if (!env.DB || !eventKey) return;
+  if (!env.DB || !eventKey || isD1WriteBlocked()) return;
   try {
     await env.DB.prepare(`DELETE FROM signal_event_guard WHERE event_key = ?`).bind(String(eventKey)).run();
   } catch (error) {
-    console.error("SIGNAL EVENT RELEASE ERROR", eventKey, error);
+    if (!blockD1Writes(error, "releaseSignalEvent")) {
+      console.error("SIGNAL EVENT RELEASE ERROR", eventKey, error);
+    }
   }
 }
 
@@ -2225,7 +2223,7 @@ async function hasOpenSignalForSymbol(env, symbol) {
 }
 
 async function createSignalPosition(env, setup, messageId) {
-  if (!env.DB || !messageId) return;
+  if (!env.DB || !messageId || isD1WriteBlocked()) return false;
   try {
     await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS signal_positions (
@@ -2258,8 +2256,11 @@ async function createSignalPosition(env, setup, messageId) {
       setup.tp1Price, setup.tp2Price, setup.tp3Price, setup.entryMid, setup.entryMid,
       "OPEN", Number(messageId)
     ).run();
+    return true;
   } catch (error) {
+    if (blockD1Writes(error, "createSignalPosition")) return false;
     console.error("SIGNAL POSITION CREATE ERROR", error);
+    return false;
   }
 }
 
@@ -2615,25 +2616,6 @@ function rsi(values, period) {
    FOLLOW-UPS
 ============================================================ */
 
-async function followupBlockedByTelegram(env, telegramId) {
-  try {
-    const req = new Request("https://multiquant.local/followup-blocked/" + encodeURIComponent(String(telegramId)));
-    const hit = await caches.default.match(req);
-    return !!hit;
-  } catch (_) {
-    return false;
-  }
-}
-
-async function markFollowupBlockedByTelegram(env, telegramId, seconds) {
-  try {
-    const req = new Request("https://multiquant.local/followup-blocked/" + encodeURIComponent(String(telegramId)));
-    await caches.default.put(req, new Response("1", {
-      headers: { "Cache-Control": "max-age=" + String(seconds || 604800) }
-    }));
-  } catch (_) {}
-}
-
 async function runFollowups(env) {
   if (!isEnabled(env, "FOLLOWUPS_ENABLED", true)) return;
   if (!env.DB) return;
@@ -2664,14 +2646,11 @@ async function runFollowups(env) {
 
     if (DEFAULTS.FOLLOWUP_DAYS.indexOf(ageDays) < 0) continue;
     if (Number(user.last_followup_day || 0) >= ageDays) continue;
-    // Telegram 403 means the user has not started the private chat (or has blocked the bot).
-    // Do not retry that user on every scheduled run; keep the suppression outside D1.
-    if (await followupBlockedByTelegram(env, user.telegram_id)) continue;
 
     const message = followupMessage(user, ageDays);
     if (!message) continue;
 
-    const sent = await sendTelegram(
+    await sendTelegram(
       env,
       String(user.telegram_id),
       message,
@@ -2687,20 +2666,12 @@ async function runFollowups(env) {
             callback_data: "not_interested"
           }]
         ]
-      },
-      { returnMeta: true }
+      }
     );
 
-    if (sent && sent.ok) {
-      // Only consume a D1 write after Telegram actually accepted the follow-up.
-      await updateUser(env, String(user.telegram_id), {
-        last_followup_day: ageDays
-      });
-    } else if (sent && Number(sent.status) === 403) {
-      // Never hammer Telegram or D1 for a user who cannot be messaged.
-      await markFollowupBlockedByTelegram(env, user.telegram_id, 604800);
-      console.warn("FOLLOWUP TELEGRAM 403 SUPPRESSED", String(user.telegram_id));
-    }
+    await updateUser(env, String(user.telegram_id), {
+      last_followup_day: ageDays
+    });
   }
 }
 
@@ -3211,37 +3182,30 @@ async function ensureSchema(env) {
 }
 
 async function ensureUser(env, telegramId, firstName, username) {
-  if (!env.DB) return;
+  if (!env.DB || isD1WriteBlocked()) return;
+  try {
+    await ensureSchema(env);
+    const existing = await env.DB.prepare(
+      "SELECT first_name, username FROM users WHERE telegram_id = ? LIMIT 1"
+    ).bind(telegramId).first();
 
-  await ensureSchema(env);
+    const nextFirst = firstName || "Friend";
+    const nextUsername = username || "";
+    if (!existing) {
+      await env.DB.prepare(`
+        INSERT INTO users (telegram_id,first_name,username,language,lead_status,followup_status,created_at,last_interaction)
+        VALUES (?, ?, ?, 'English', 'new', 'active', datetime('now'), datetime('now'))
+      `).bind(telegramId, nextFirst, nextUsername).run();
+      return;
+    }
 
-  // This function is called for every Telegram message. Do not perform an
-  // INSERT ... ON CONFLICT UPDATE on every message: that consumes a D1 row
-  // write even when the user already exists. Existing users are updated by
-  // the normal conversation flow only when their data actually changes.
-  const existing = await env.DB.prepare(
-    "SELECT telegram_id FROM users WHERE telegram_id = ? LIMIT 1"
-  ).bind(telegramId).first();
-
-  if (existing) return;
-
-  await env.DB.prepare(`
-    INSERT INTO users (
-      telegram_id,
-      first_name,
-      username,
-      language,
-      lead_status,
-      followup_status,
-      created_at,
-      last_interaction
-    )
-    VALUES (?, ?, ?, 'English', 'new', 'active', datetime('now'), datetime('now'))
-  `).bind(
-    telegramId,
-    firstName || "Friend",
-    username || ""
-  ).run();
+    if (String(existing.first_name || "") !== String(nextFirst) || String(existing.username || "") !== String(nextUsername)) {
+      await env.DB.prepare("UPDATE users SET first_name=?, username=?, last_interaction=datetime('now') WHERE telegram_id=?")
+        .bind(nextFirst, nextUsername, telegramId).run();
+    }
+  } catch (error) {
+    if (!blockD1Writes(error, "ensureUser")) console.error("ENSURE USER ERROR", error);
+  }
 }
 
 async function getUser(env, telegramId) {
@@ -3257,7 +3221,7 @@ async function getUser(env, telegramId) {
 }
 
 async function updateUser(env, telegramId, fields) {
-  if (!env.DB) return;
+  if (!env.DB || isD1WriteBlocked()) return;
 
   await ensureSchema(env);
 
@@ -3293,52 +3257,39 @@ async function updateUser(env, telegramId, fields) {
     return fields[key];
   });
 
-  await env.DB.prepare(
-    "UPDATE users SET " + setClause + " WHERE telegram_id = ?"
-  ).bind(
-    ...values,
-    telegramId
-  ).run();
+  try {
+    await env.DB.prepare(
+      "UPDATE users SET " + setClause + " WHERE telegram_id = ?"
+    ).bind(
+      ...values,
+      telegramId
+    ).run();
+  } catch (error) {
+    if (!blockD1Writes(error, "updateUser")) throw error;
+  }
 }
 
 async function saveMessage(env, telegramId, role, content) {
-  if (!env.DB) return;
-
-  await ensureSchema(env);
-
-  await env.DB.prepare(`
-    INSERT INTO messages (
-      telegram_id,
-      role,
-      content,
-      created_at
-    )
-    VALUES (?, ?, ?, datetime('now'))
-  `).bind(
-    telegramId,
-    role,
-    content
-  ).run();
-
-  // Keep only recent history to control D1 size.
+  if (!env.DB || isD1WriteBlocked()) return;
   try {
+    await ensureSchema(env);
     await env.DB.prepare(`
-      DELETE FROM messages
-      WHERE telegram_id = ?
-        AND id NOT IN (
-          SELECT id
-          FROM messages
-          WHERE telegram_id = ?
-          ORDER BY id DESC
-          LIMIT ?
-        )
-    `).bind(
-      telegramId,
-      telegramId,
-      DEFAULTS.MAX_HISTORY
-    ).run();
+      INSERT INTO messages (telegram_id,role,content,created_at)
+      VALUES (?, ?, ?, datetime('now'))
+    `).bind(telegramId, role, content).run();
+    try {
+      await env.DB.prepare(`
+        DELETE FROM messages
+        WHERE telegram_id = ?
+          AND id NOT IN (
+            SELECT id FROM messages WHERE telegram_id = ? ORDER BY id DESC LIMIT ?
+          )
+      `).bind(telegramId, telegramId, DEFAULTS.MAX_HISTORY).run();
+    } catch (error) {
+      if (!blockD1Writes(error, "messageTrim")) console.error("MESSAGE TRIM ERROR", error);
+    }
   } catch (error) {
-    console.error("MESSAGE TRIM ERROR", error);
+    if (!blockD1Writes(error, "saveMessage")) throw error;
   }
 }
 
@@ -3362,17 +3313,18 @@ async function getMeta(env, key) {
 }
 
 async function setMeta(env, key, value) {
-  if (!env.DB) return;
-
-  await ensureSchema(env);
-
-  await env.DB.prepare(`
-    INSERT OR REPLACE INTO bot_meta (key, value, updated_at)
-    VALUES (?, ?, datetime('now'))
-  `).bind(
-    key,
-    value
-  ).run();
+  if (!env.DB || isD1WriteBlocked()) return false;
+  try {
+    await ensureSchema(env);
+    await env.DB.prepare(`
+      INSERT OR REPLACE INTO bot_meta (key, value, updated_at)
+      VALUES (?, ?, datetime('now'))
+    `).bind(key, value).run();
+    return true;
+  } catch (error) {
+    if (blockD1Writes(error, "setMeta")) return false;
+    throw error;
+  }
 }
 
 /* ============================================================
@@ -3464,11 +3416,7 @@ export class OkxMonitorDO extends DurableObject {
     // live updates repeatedly while a candle is forming. Monitoring/TP/SL
     // calculations stay real-time in memory; D1 is only persisted periodically.
     this.lastPersistAt = new Map();
-    this.persistIntervalMs = 5 * 60 * 1000;
-    // Circuit breaker: when D1 daily write quota is exhausted, stop retrying
-    // D1 writes until the next UTC quota reset instead of generating an error
-    // for every incoming OKX candle. Real-time monitoring continues in memory.
-    this.d1WriteBlockedUntil = 0;
+    this.persistIntervalMs = 30 * 1000;
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
     this.connectWebSocket();
@@ -3802,7 +3750,7 @@ export class OkxMonitorDO extends DurableObject {
   }
 
   async syncPositions() {
-    if (!this.env.DB) return;
+    if (!this.env.DB || isD1WriteBlocked()) return;
     try {
       const result = await this.env.DB.prepare(`SELECT * FROM signal_positions WHERE status='OPEN' ORDER BY id ASC LIMIT 100`).all();
       const rows = result && result.results ? result.results : [];
@@ -3849,24 +3797,6 @@ export class OkxMonitorDO extends DurableObject {
     }
   }
 
-  isD1WriteBlocked() {
-    return Date.now() < Number(this.d1WriteBlockedUntil || 0);
-  }
-
-  blockD1Writes(error) {
-    const msg = String(error && error.message ? error.message : error || "");
-    if (!/D1_ERROR|daily row write limit|free tier/i.test(msg)) return false;
-    const now = new Date();
-    const nextUtcMidnight = Date.UTC(
-      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0
-    );
-    this.d1WriteBlockedUntil = nextUtcMidnight + 60 * 1000;
-    console.warn("D1 WRITE CIRCUIT BREAKER", JSON.stringify({
-      blockedUntil: new Date(this.d1WriteBlockedUntil).toISOString()
-    }));
-    return true;
-  }
-
   async processCandle(symbol, candle) {
     const pos = this.positions.get(symbol);
     if (!pos || String(pos.status) !== "OPEN") return;
@@ -3881,10 +3811,7 @@ export class OkxMonitorDO extends DurableObject {
       if (Number(pos[field] || 0)) continue;
       const hit = pos.direction === "LONG" ? Number(pos.highest_price) >= target : Number(pos.lowest_price) <= target;
       if (!hit) continue;
-      // If D1 is currently exhausted, do not hammer it on every candle.
-      // Keep the TP state in the live Durable Object; it will be persisted
-      // after the D1 quota resets.
-      if (this.isD1WriteBlocked()) {
+      if (isD1WriteBlocked()) {
         pos[field] = 1;
         newlyReached.push({name,price:target});
         continue;
@@ -3896,7 +3823,12 @@ export class OkxMonitorDO extends DurableObject {
           newlyReached.push({name,price:target});
         }
       } catch (e) {
-        if (!this.blockD1Writes(e)) console.error("OKX TP CLAIM ERROR", symbol, name, e);
+        if (blockD1Writes(e, "okxTpClaim")) {
+          pos[field] = 1;
+          newlyReached.push({name,price:target});
+        } else {
+          console.error("OKX TP CLAIM ERROR", symbol, name, e);
+        }
       }
     }
     for (const hit of newlyReached) {
@@ -3904,10 +3836,7 @@ export class OkxMonitorDO extends DurableObject {
       const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*"+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
       if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
     }
-
-    // Do not write position state to D1 on every live candle update.
-    // TP claims and closes already persist the critical state; normal
-    // high/low state is flushed periodically by the DO alarm.
+    await this.persistPosition(pos);
 
     const anyTp = Number(pos.tp1_hit)||Number(pos.tp2_hit)||Number(pos.tp3_hit);
     let effectiveStop = Number(pos.sl_price);
@@ -3925,14 +3854,11 @@ export class OkxMonitorDO extends DurableObject {
     const peakPct = Math.max(0,reportMovePct(pos.direction,pos.entry_mid,peak)||0);
     const reportProfit = anyTp ? peakPct : realizedAtClose;
     const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
-    if (this.isD1WriteBlocked()) return;
-    let claim;
-    try {
-      claim = await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(Number(pos.id)).run();
-    } catch (e) {
-      if (!this.blockD1Writes(e)) console.error("OKX MONITOR CLOSE CLAIM ERROR", symbol, e);
+    if (isD1WriteBlocked()) {
+      console.warn("OKX MONITOR CLOSE D1 BLOCK", symbol);
       return;
     }
+    const claim=await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(Number(pos.id)).run();
     if (Number(claim?.meta?.changes||0)!==1) return;
     pos.status="CLOSING"; this.positions.delete(symbol); await this.reconcileSubscriptions(false);
     const msg = anyTp
@@ -3940,16 +3866,12 @@ export class OkxMonitorDO extends DurableObject {
       : "😔 *SL HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n\n💰 SL Price: `"+reportFmt(closePrice)+"`\n📉 Loss: *"+(realizedAtClose>=0?"+":"")+realizedAtClose.toFixed(1)+"%*\n\n🔒 Position Closed";
     try { if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id); }
     finally {
-      try {
-        await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSED',closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(closePrice,reportProfit,peakPct,reason,Number(pos.id)).run();
-      } catch (e) {
-        if (!this.blockD1Writes(e)) console.error("OKX MONITOR CLOSE PERSIST ERROR", symbol, e);
-      }
+      await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSED',closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(closePrice,reportProfit,peakPct,reason,Number(pos.id)).run();
     }
   }
 
   async persistPosition(pos, force = false) {
-    if (!this.env.DB || !pos || !pos.id) return false;
+    if (!this.env.DB || !pos || !pos.id || isD1WriteBlocked()) return false;
 
     const id = Number(pos.id);
     const now = Date.now();
@@ -3957,7 +3879,6 @@ export class OkxMonitorDO extends DurableObject {
 
     // OKX candle5m is a streaming channel: the current candle can generate
     // many updates before it closes. Do not write every update to D1.
-    if (this.isD1WriteBlocked()) return false;
     if (!force && now - last < this.persistIntervalMs) return false;
 
     try {
@@ -3976,16 +3897,13 @@ export class OkxMonitorDO extends DurableObject {
       this.lastPersistAt.set(id, now);
       return true;
     } catch (error) {
+      if (blockD1Writes(error, "persistPosition")) return false;
       // Persistence failure must NEVER stop real-time TP/SL monitoring.
-      // If this is the D1 daily write-limit error, trip the circuit breaker
-      // so the same failure is not logged thousands of times.
-      if (!this.blockD1Writes(error)) {
-        console.error("OKX MONITOR POSITION PERSIST ERROR", JSON.stringify({
-          id,
-          symbol: pos.symbol,
-          error: error && error.message ? error.message : String(error)
-        }));
-      }
+      console.error("OKX MONITOR POSITION PERSIST ERROR", JSON.stringify({
+        id,
+        symbol: pos.symbol,
+        error: error && error.message ? error.message : String(error)
+      }));
       return false;
     }
   }
@@ -4001,8 +3919,7 @@ export class OkxMonitorDO extends DurableObject {
    TELEGRAM API
 ============================================================ */
 
-async function sendTelegram(env, chatId, text, replyMarkup, options) {
-  const returnMeta = !!(options && options.returnMeta);
+async function sendTelegram(env, chatId, text, replyMarkup) {
   if (!env.TELEGRAM_BOT_TOKEN) {
     console.error("TELEGRAM_BOT_TOKEN missing");
     return false;
@@ -4026,16 +3943,12 @@ async function sendTelegram(env, chatId, text, replyMarkup, options) {
       }
     );
     if (!response.ok) {
-      const errorText = await response.text();
-      if (returnMeta) return { ok: false, status: response.status, error: errorText };
-      console.error("TELEGRAM ERROR", response.status, errorText);
+      console.error("TELEGRAM ERROR", response.status, await response.text());
       return false;
     }
     const data = await response.json();
-    if (returnMeta) return { ok: !!(data && data.ok), status: response.status, result: data && data.result };
     return data && data.ok ? data.result : false;
   } catch (error) {
-    if (returnMeta) return { ok: false, status: 0, error: String(error) };
     console.error("TELEGRAM FETCH ERROR", error);
     return false;
   }
