@@ -1522,13 +1522,21 @@ async function runNewsJob(env) {
         escapeMarkdown(parsed.impact) + "\n\n" +
         "[🔗 Source](" + item.link.replace(/[)\\]/g, "") + ")";
 
+      // Claim the story in Durable Object storage immediately before publish.
+      // This remains effective even when D1 is temporarily read/write limited.
+      const dedupKey = titleKey || linkKey;
+      const claimed = await claimNewsFingerprint(env, dedupKey, 6 * 60 * 60 * 1000);
+      if (!claimed) continue;
+
       const sent = await sendNewsChannel(env, finalText);
       if (sent) {
-        // Store both URL and normalized-title fingerprints. This prevents
-        // syndicated copies of the same story from being reposted.
+        // Store both URL and normalized-title fingerprints in D1 when available.
+        // The Durable Object claim above is the authoritative duplicate guard.
         await setMeta(env, linkKey, "1");
         await setMeta(env, titleKey, "1");
         await setMeta(env, "news:last_published", String(Date.now()));
+      } else {
+        await releaseNewsFingerprint(env, dedupKey);
       }
       return;
     } catch (error) {
@@ -2298,6 +2306,10 @@ async function createSignalPosition(env, setup, messageId) {
 }
 
 async function monitorOpenSignals(env, tickers) {
+  // Legacy D1/ticker monitor intentionally disabled. OkxMonitorDO is the single
+  // authoritative TP/SL monitor; keeping a second engine risks duplicate alerts.
+  return;
+  /*
   if (!env.DB || !isEnabled(env, "SIGNALS_ENABLED", true)) return;
   try {
     await ensureSchema(env);
@@ -3364,6 +3376,40 @@ async function setMeta(env, key, value) {
    SCHEDULED JOBS
 ============================================================ */
 
+async function claimNewsFingerprint(env, key, ttlMs) {
+  if (!env.OKX_MONITOR || !key) return false;
+  try {
+    const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
+    const stub = env.OKX_MONITOR.get(id);
+    const response = await stub.fetch("https://okx-monitor/news-claim", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: String(key), ttlMs: Number(ttlMs) || 6 * 60 * 60 * 1000 })
+    });
+    if (!response.ok) return false;
+    const data = await response.json();
+    return !!(data && data.claimed);
+  } catch (error) {
+    console.error("NEWS DEDUP CLAIM ERROR", error);
+    // If the dedup store is unavailable, do not publish. This is safer than
+    // risking a duplicate blast every 5-minute cron tick.
+    return false;
+  }
+}
+
+async function releaseNewsFingerprint(env, key) {
+  if (!env.OKX_MONITOR || !key) return;
+  try {
+    const id = env.OKX_MONITOR.idFromName("multiquant-open-positions");
+    const stub = env.OKX_MONITOR.get(id);
+    await stub.fetch("https://okx-monitor/news-release", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: String(key) })
+    });
+  } catch (_) {}
+}
+
 async function syncOkxMonitorDurableObject(env) {
   if (!env.OKX_MONITOR || !env.DB) return;
   try {
@@ -3449,10 +3495,11 @@ export class OkxMonitorDO extends DurableObject {
     // live updates repeatedly while a candle is forming. Monitoring/TP/SL
     // calculations stay real-time in memory; D1 is only persisted periodically.
     this.lastPersistAt = new Map();
-    this.persistIntervalMs = 30 * 1000;
+    this.persistIntervalMs = 5 * 60 * 1000;
     // TP notifications must remain idempotent even if D1 is unavailable or
     // the Durable Object is restarted. These keys live in DO storage, not D1.
     this.tpNotificationKeys = new Set();
+    this.tpNotificationInFlight = new Set();
     this.tpNotificationReady = this.state.storage.list({ prefix: "tpnotify:" }).then(entries => {
       for (const key of entries.keys()) this.tpNotificationKeys.add(key);
     }).catch(() => {});
@@ -3487,6 +3534,32 @@ export class OkxMonitorDO extends DurableObject {
         tickers: this.tickerCache.size,
         lastSyncAt: this.lastSyncAt
       }), { headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/news-claim" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const key = "newsdedup:" + String(body && body.key || "");
+        if (key === "newsdedup:") return jsonResponse({ claimed: false }, 400);
+        const ttlMs = Math.max(60 * 1000, Number(body.ttlMs) || 6 * 60 * 60 * 1000);
+        const existing = await this.state.storage.get(key);
+        const nowMs = Date.now();
+        if (existing && Number(existing) > nowMs) {
+          return jsonResponse({ claimed: false });
+        }
+        await this.state.storage.put(key, nowMs + ttlMs);
+        return jsonResponse({ claimed: true });
+      } catch (error) {
+        console.error("NEWS DEDUP CLAIM HANDLER ERROR", error);
+        return jsonResponse({ claimed: false }, 500);
+      }
+    }
+    if (url.pathname === "/news-release" && request.method === "POST") {
+      try {
+        const body = await request.json();
+        const key = "newsdedup:" + String(body && body.key || "");
+        if (key !== "newsdedup:") await this.state.storage.delete(key);
+      } catch (_) {}
+      return new Response("OK");
     }
     return new Response("OK");
   }
@@ -3875,13 +3948,18 @@ export class OkxMonitorDO extends DurableObject {
       // true across D1 quota outages and Durable Object restarts.
       await this.tpNotificationReady;
       const notifyKey = `tpnotify:${Number(pos.id)}:${hit.name}`;
-      if (this.tpNotificationKeys.has(notifyKey)) continue;
-      this.tpNotificationKeys.add(notifyKey);
+      if (this.tpNotificationKeys.has(notifyKey) || this.tpNotificationInFlight.has(notifyKey)) continue;
+      this.tpNotificationInFlight.add(notifyKey);
       try { await this.state.storage.put(notifyKey, Date.now()); } catch (_) {}
+      this.tpNotificationKeys.add(notifyKey);
 
       const pct = Math.abs((Number(hit.price)-Number(pos.entry_mid))/Number(pos.entry_mid))*1000;
       const msg = "🎯 *"+hit.name+" HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n💰 Price: `"+reportFmt(hit.price)+"`\n📈 Profit: *+"+pct.toFixed(1)+"%*"+(hit.name==="TP1"?"\n\n⚠️ SL is now protected at entry.":"");
-      if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
+      try {
+        if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id);
+      } finally {
+        this.tpNotificationInFlight.delete(notifyKey);
+      }
     }
     await this.persistPosition(pos);
 
@@ -3960,6 +4038,7 @@ export class OkxMonitorDO extends DurableObject {
       await this.persistPosition(pos, true);
     }
   }
+  */
 }
 
 /* ============================================================
