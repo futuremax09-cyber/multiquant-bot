@@ -2615,6 +2615,25 @@ function rsi(values, period) {
    FOLLOW-UPS
 ============================================================ */
 
+async function followupBlockedByTelegram(env, telegramId) {
+  try {
+    const req = new Request("https://multiquant.local/followup-blocked/" + encodeURIComponent(String(telegramId)));
+    const hit = await caches.default.match(req);
+    return !!hit;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function markFollowupBlockedByTelegram(env, telegramId, seconds) {
+  try {
+    const req = new Request("https://multiquant.local/followup-blocked/" + encodeURIComponent(String(telegramId)));
+    await caches.default.put(req, new Response("1", {
+      headers: { "Cache-Control": "max-age=" + String(seconds || 604800) }
+    }));
+  } catch (_) {}
+}
+
 async function runFollowups(env) {
   if (!isEnabled(env, "FOLLOWUPS_ENABLED", true)) return;
   if (!env.DB) return;
@@ -2645,11 +2664,14 @@ async function runFollowups(env) {
 
     if (DEFAULTS.FOLLOWUP_DAYS.indexOf(ageDays) < 0) continue;
     if (Number(user.last_followup_day || 0) >= ageDays) continue;
+    // Telegram 403 means the user has not started the private chat (or has blocked the bot).
+    // Do not retry that user on every scheduled run; keep the suppression outside D1.
+    if (await followupBlockedByTelegram(env, user.telegram_id)) continue;
 
     const message = followupMessage(user, ageDays);
     if (!message) continue;
 
-    await sendTelegram(
+    const sent = await sendTelegram(
       env,
       String(user.telegram_id),
       message,
@@ -2665,12 +2687,20 @@ async function runFollowups(env) {
             callback_data: "not_interested"
           }]
         ]
-      }
+      },
+      { returnMeta: true }
     );
 
-    await updateUser(env, String(user.telegram_id), {
-      last_followup_day: ageDays
-    });
+    if (sent && sent.ok) {
+      // Only consume a D1 write after Telegram actually accepted the follow-up.
+      await updateUser(env, String(user.telegram_id), {
+        last_followup_day: ageDays
+      });
+    } else if (sent && Number(sent.status) === 403) {
+      // Never hammer Telegram or D1 for a user who cannot be messaged.
+      await markFollowupBlockedByTelegram(env, user.telegram_id, 604800);
+      console.warn("FOLLOWUP TELEGRAM 403 SUPPRESSED", String(user.telegram_id));
+    }
   }
 }
 
@@ -3923,7 +3953,8 @@ export class OkxMonitorDO extends DurableObject {
    TELEGRAM API
 ============================================================ */
 
-async function sendTelegram(env, chatId, text, replyMarkup) {
+async function sendTelegram(env, chatId, text, replyMarkup, options) {
+  const returnMeta = !!(options && options.returnMeta);
   if (!env.TELEGRAM_BOT_TOKEN) {
     console.error("TELEGRAM_BOT_TOKEN missing");
     return false;
@@ -3947,12 +3978,16 @@ async function sendTelegram(env, chatId, text, replyMarkup) {
       }
     );
     if (!response.ok) {
-      console.error("TELEGRAM ERROR", response.status, await response.text());
+      const errorText = await response.text();
+      if (returnMeta) return { ok: false, status: response.status, error: errorText };
+      console.error("TELEGRAM ERROR", response.status, errorText);
       return false;
     }
     const data = await response.json();
+    if (returnMeta) return { ok: !!(data && data.ok), status: response.status, result: data && data.result };
     return data && data.ok ? data.result : false;
   } catch (error) {
+    if (returnMeta) return { ok: false, status: 0, error: String(error) };
     console.error("TELEGRAM FETCH ERROR", error);
     return false;
   }
