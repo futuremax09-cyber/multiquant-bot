@@ -3465,6 +3465,10 @@ export class OkxMonitorDO extends DurableObject {
     // calculations stay real-time in memory; D1 is only persisted periodically.
     this.lastPersistAt = new Map();
     this.persistIntervalMs = 5 * 60 * 1000;
+    // Circuit breaker: when D1 daily write quota is exhausted, stop retrying
+    // D1 writes until the next UTC quota reset instead of generating an error
+    // for every incoming OKX candle. Real-time monitoring continues in memory.
+    this.d1WriteBlockedUntil = 0;
     this.tickerInstrumentIds = null;
     this.tickerInstrumentFetchedAt = 0;
     this.connectWebSocket();
@@ -3845,6 +3849,24 @@ export class OkxMonitorDO extends DurableObject {
     }
   }
 
+  isD1WriteBlocked() {
+    return Date.now() < Number(this.d1WriteBlockedUntil || 0);
+  }
+
+  blockD1Writes(error) {
+    const msg = String(error && error.message ? error.message : error || "");
+    if (!/D1_ERROR|daily row write limit|free tier/i.test(msg)) return false;
+    const now = new Date();
+    const nextUtcMidnight = Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0
+    );
+    this.d1WriteBlockedUntil = nextUtcMidnight + 60 * 1000;
+    console.warn("D1 WRITE CIRCUIT BREAKER", JSON.stringify({
+      blockedUntil: new Date(this.d1WriteBlockedUntil).toISOString()
+    }));
+    return true;
+  }
+
   async processCandle(symbol, candle) {
     const pos = this.positions.get(symbol);
     if (!pos || String(pos.status) !== "OPEN") return;
@@ -3859,13 +3881,23 @@ export class OkxMonitorDO extends DurableObject {
       if (Number(pos[field] || 0)) continue;
       const hit = pos.direction === "LONG" ? Number(pos.highest_price) >= target : Number(pos.lowest_price) <= target;
       if (!hit) continue;
+      // If D1 is currently exhausted, do not hammer it on every candle.
+      // Keep the TP state in the live Durable Object; it will be persisted
+      // after the D1 quota resets.
+      if (this.isD1WriteBlocked()) {
+        pos[field] = 1;
+        newlyReached.push({name,price:target});
+        continue;
+      }
       try {
         const r = await this.env.DB.prepare(`UPDATE signal_positions SET ${field}=1,highest_price=?,lowest_price=?,updated_at=datetime('now') WHERE id=? AND status='OPEN' AND ${field}=0`).bind(Number(pos.highest_price),Number(pos.lowest_price),Number(pos.id)).run();
         if (Number(r?.meta?.changes || 0) === 1) {
           pos[field]=1;
           newlyReached.push({name,price:target});
         }
-      } catch (e) { console.error("OKX TP CLAIM ERROR", symbol, name, e); }
+      } catch (e) {
+        if (!this.blockD1Writes(e)) console.error("OKX TP CLAIM ERROR", symbol, name, e);
+      }
     }
     for (const hit of newlyReached) {
       const pct = Math.abs((Number(hit.price)-Number(pos.entry_mid))/Number(pos.entry_mid))*1000;
@@ -3893,7 +3925,14 @@ export class OkxMonitorDO extends DurableObject {
     const peakPct = Math.max(0,reportMovePct(pos.direction,pos.entry_mid,peak)||0);
     const reportProfit = anyTp ? peakPct : realizedAtClose;
     const reason = anyTp ? "Trailing/Reversal" : "Direct SL";
-    const claim=await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(Number(pos.id)).run();
+    if (this.isD1WriteBlocked()) return;
+    let claim;
+    try {
+      claim = await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSING',updated_at=datetime('now') WHERE id=? AND status='OPEN'").bind(Number(pos.id)).run();
+    } catch (e) {
+      if (!this.blockD1Writes(e)) console.error("OKX MONITOR CLOSE CLAIM ERROR", symbol, e);
+      return;
+    }
     if (Number(claim?.meta?.changes||0)!==1) return;
     pos.status="CLOSING"; this.positions.delete(symbol); await this.reconcileSubscriptions(false);
     const msg = anyTp
@@ -3901,7 +3940,11 @@ export class OkxMonitorDO extends DurableObject {
       : "😔 *SL HIT*\n\n📌 "+pos.pair+" — "+pos.direction+"\n\n💰 SL Price: `"+reportFmt(closePrice)+"`\n📉 Loss: *"+(realizedAtClose>=0?"+":"")+realizedAtClose.toFixed(1)+"%*\n\n🔒 Position Closed";
     try { if (pos.channel_message_id) await sendTelegramReply(this.env,msg,pos.channel_message_id); }
     finally {
-      await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSED',closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(closePrice,reportProfit,peakPct,reason,Number(pos.id)).run();
+      try {
+        await this.env.DB.prepare("UPDATE signal_positions SET status='CLOSED',closed_at=datetime('now'),close_price=?,realized_profit_pct=?,highest_profit_pct=?,close_reason=?,updated_at=datetime('now') WHERE id=? AND status='CLOSING'").bind(closePrice,reportProfit,peakPct,reason,Number(pos.id)).run();
+      } catch (e) {
+        if (!this.blockD1Writes(e)) console.error("OKX MONITOR CLOSE PERSIST ERROR", symbol, e);
+      }
     }
   }
 
@@ -3914,6 +3957,7 @@ export class OkxMonitorDO extends DurableObject {
 
     // OKX candle5m is a streaming channel: the current candle can generate
     // many updates before it closes. Do not write every update to D1.
+    if (this.isD1WriteBlocked()) return false;
     if (!force && now - last < this.persistIntervalMs) return false;
 
     try {
@@ -3933,11 +3977,15 @@ export class OkxMonitorDO extends DurableObject {
       return true;
     } catch (error) {
       // Persistence failure must NEVER stop real-time TP/SL monitoring.
-      console.error("OKX MONITOR POSITION PERSIST ERROR", JSON.stringify({
-        id,
-        symbol: pos.symbol,
-        error: error && error.message ? error.message : String(error)
-      }));
+      // If this is the D1 daily write-limit error, trip the circuit breaker
+      // so the same failure is not logged thousands of times.
+      if (!this.blockD1Writes(error)) {
+        console.error("OKX MONITOR POSITION PERSIST ERROR", JSON.stringify({
+          id,
+          symbol: pos.symbol,
+          error: error && error.message ? error.message : String(error)
+        }));
+      }
       return false;
     }
   }
